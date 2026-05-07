@@ -1,0 +1,78 @@
+{
+  "skill_name": "salesforce-alm-github",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "We're migrating off our current change management tool and need to set up GitHub Actions for our Salesforce project. We have a dev hub, three sandboxes (dev, qa, staging), and production. Can you help us get started with CI/CD? We want to validate changes on PRs and deploy to production when we merge to main.",
+      "expected_output": "Complete GitHub Actions workflows including validate-pr.yml and deploy-production.yml, with authentication setup, testing strategy, and documentation on how to configure GitHub secrets.",
+      "files": [],
+      "assertions": [
+        {"name": "Creates validate-pr workflow file", "description": "Should create a .github/workflows file for PR validation"},
+        {"name": "Creates deploy-production workflow file", "description": "Should create a .github/workflows file for production deployment"},
+        {"name": "Includes SF CLI installation", "description": "Workflows should install Salesforce CLI"},
+        {"name": "Includes authentication steps", "description": "Workflows should authenticate to Salesforce orgs"},
+        {"name": "Includes test execution", "description": "Workflows should run Apex tests"},
+        {"name": "Provides setup documentation", "description": "Should include documentation on how to configure GitHub secrets"},
+        {"name": "Explains branch strategy", "description": "Documentation should explain the branch workflow (PR → main → deploy)"}
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "I need to test my Apex changes across three different Salesforce orgs simultaneously - our Financial Services Cloud sandbox, Health Cloud sandbox, and standard Enterprise Edition sandbox. Right now I have to manually deploy to each one which takes forever. How can I automate this with GitHub Actions?",
+      "expected_output": "GitHub Actions workflow using matrix strategy to run parallel deployments and tests across all three org types, with explanation of the architectural value and time savings.",
+      "files": [],
+      "assertions": [
+        {"name": "Uses GitHub Actions matrix strategy", "description": "Workflow should include strategy.matrix configuration"},
+        {"name": "Defines all three org types in matrix", "description": "Matrix should include FSC, Health Cloud, and Enterprise Edition"},
+        {"name": "Deploys to all orgs in parallel", "description": "Workflow should trigger parallel jobs for each org"},
+        {"name": "Explains time savings", "description": "Documentation should explain parallel vs sequential deployment time benefits"},
+        {"name": "Includes authentication for multiple orgs", "description": "Should explain how to set up secrets for each org"},
+        {"name": "References Pattern 1 from skill", "description": "Should demonstrate the Matrix Strategy pattern from the skill"}
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Our compliance team says we need better governance for our Salesforce deployments. We have some repos that are SOX-compliant and need extra controls, and we're starting to build Agentforce agents which need security scanning for prompt injections. Can GitHub help with this? We have GitHub Enterprise.",
+      "expected_output": "Implementation using GitHub Custom Properties for compliance tiers and agentforce-enabled flags, with conditional workflows that enforce SOX compliance checks and Agentforce-specific security scanning (prompt injection detection, grounding validation, PII checks).",
+      "files": [],
+      "assertions": [
+        {"name": "Uses GitHub Custom Properties", "description": "Solution should leverage Custom Properties for compliance-tier and agentforce-enabled"},
+        {"name": "Implements conditional workflows based on properties", "description": "Workflows should have conditional steps based on repository custom properties"},
+        {"name": "Includes SOX compliance checks", "description": "Should implement enhanced controls for SOX-compliant repositories"},
+        {"name": "Includes Agentforce security scanning", "description": "Should scan for prompt injection vulnerabilities in Agentforce code"},
+        {"name": "Checks for PII exposure in agents", "description": "Should validate that agent metadata doesn't contain PII"},
+        {"name": "Validates LLM grounding implementation", "description": "Should check for proper grounding methods in Agentforce agents"},
+        {"name": "Explains GitHub Enterprise governance features", "description": "Documentation should explain how GitHub Enterprise provides governance capabilities"}
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "Our production deployments take 45 minutes because we have to run all the Apex tests again even though we already validated them on the PR. Is there a way to speed this up?",
+      "expected_output": "Quick Deploy pattern using GitHub Artifacts to pass validation job IDs between workflows, with explanation of how this reduces deployment time from 45 minutes to ~3 minutes by reusing validation results.",
+      "files": [],
+      "assertions": [
+        {"name": "Uses GitHub Artifacts for job ID passing", "description": "Should use actions/upload-artifact and actions/download-artifact"},
+        {"name": "Captures validation job ID", "description": "PR validation workflow should save the Salesforce validation job ID"},
+        {"name": "Uses sf project deploy quick command", "description": "Production deployment should use 'sf project deploy quick --job-id'"},
+        {"name": "Explains time savings (45 min to 3-5 min)", "description": "Documentation should highlight the dramatic time reduction"},
+        {"name": "Includes fallback to full deployment", "description": "Should handle cases where artifact is missing or expired"},
+        {"name": "References Pattern 3 from skill", "description": "Should demonstrate the Quick Deploy pattern from the skill"}
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "I'm running an ALM workshop next week for our Salesforce team. They're used to clicking buttons to deploy and they're nervous about the move to GitHub Actions. What are the key talking points I should cover to show them why this is better? Especially for our move toward Agentforce.",
+      "expected_output": "Workshop facilitation guidance covering all five GitHub Actions patterns with business value propositions, concrete time/cost savings examples, comparison to declarative tools (without naming specific vendors), and emphasis on Agentforce readiness and multi-cloud scaling. Should include talking points about increased visibility, better governance, and modern orchestration.",
+      "files": [],
+      "assertions": [
+        {"name": "Covers all five GitHub Actions patterns", "description": "Should discuss Matrix Strategy, OIDC, Quick Deploy, Repository Dispatch, and Custom Properties"},
+        {"name": "Addresses team nervousness about change", "description": "Should acknowledge concerns and provide reassurance about the transition"},
+        {"name": "Explains Agentforce-specific benefits", "description": "Should highlight why modern ALM is essential for Agentforce (multi-cloud, rapid iteration, security)"},
+        {"name": "Provides concrete time/cost savings examples", "description": "Should include specific metrics demonstrating ROI"},
+        {"name": "Avoids naming specific vendor tools", "description": "Should not mention Copado or other specific declarative tools by name"},
+        {"name": "Emphasizes API-first orchestration", "description": "Should frame GitHub Actions as modern, API-first approach vs button-clicking"},
+        {"name": "Includes workshop structure or agenda", "description": "Should provide a structured approach for conducting the workshop"}
+      ]
+    }
+  ]
+}

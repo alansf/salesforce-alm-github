@@ -1,0 +1,6 @@
+# Workspace and test results
+*-workspace/
+.DS_Store
+*.pyc
+__pycache__/
+.pytest_cache/
