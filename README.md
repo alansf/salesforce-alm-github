@@ -18,7 +18,7 @@ This Claude Code skill guides Salesforce teams through modernizing their applica
 * [Table of Contents](#table-of-contents)
   * [What Problem Does This Solve?](#what-problem-does-this-solve)
   * [Solution Overview](#solution-overview)
-  * [The Five GitHub Actions Superpowers](#the-five-github-actions-superpowers)
+  * [The Seven GitHub Actions Patterns](#the-seven-github-actions-patterns)
   * [Key Features](#key-features)
   * [Quick Start](#quick-start)
     * [Installation](#installation)
@@ -29,12 +29,14 @@ This Claude Code skill guides Salesforce teams through modernizing their applica
     * [3. Implement Governance and Agentforce Security](#3-implement-governance-and-agentforce-security)
     * [4. Speed Up Production Deployments](#4-speed-up-production-deployments)
     * [5. Conduct ALM Workshop](#5-conduct-alm-workshop)
-  * [The Five Patterns Explained](#the-five-patterns-explained)
+  * [The Seven Patterns Explained](#the-seven-patterns-explained)
     * [Pattern 1: Matrix Strategy](#pattern-1-matrix-strategy)
-    * [Pattern 2: OIDC with Custom Properties](#pattern-2-oidc-with-custom-properties)
+    * [Pattern 2: Secure JWT + Custom Properties (with optional Identity Broker)](#pattern-2-secure-jwt--custom-properties-with-optional-identity-broker)
     * [Pattern 3: Quick Deploy Pattern](#pattern-3-quick-deploy-pattern)
     * [Pattern 4: Repository Dispatch](#pattern-4-repository-dispatch)
     * [Pattern 5: Custom Properties for Governance](#pattern-5-custom-properties-for-governance)
+    * [Pattern 6: Delta Deployments with sfdx-git-delta](#pattern-6-delta-deployments-with-sfdx-git-delta)
+    * [Pattern 7: Unlocked Package Development](#pattern-7-unlocked-package-development)
   * [Agentforce-Specific Capabilities](#agentforce-specific-capabilities)
   * [Why GitHub Actions for Salesforce ALM?](#why-github-actions-for-salesforce-alm)
   * [Operating Modes](#operating-modes)
@@ -60,7 +62,7 @@ When building enterprise Salesforce applications, especially with Agentforce and
 3. **Weak Governance**: No fine-grained control over who can deploy what to which environment
 4. **Slow Deployments**: Running the same Apex tests multiple times wastes 30-45 minutes per deployment
 5. **Siloed Systems**: No coordination between Salesforce, external APIs, and multi-cloud components
-6. **Agentforce Security Gaps**: No automated scanning for prompt injection, PII exposure, or grounding issues
+6. **Agentforce Metadata Validation Gaps**: No structured validation of agent metadata (Bot configuration, plugin permission scoping, Trust Layer settings) at deploy time. *Note: real prompt-injection defense lives in the runtime Einstein Trust Layer — CI handles structural correctness, not runtime safety.*
 
 This skill provides **GitHub-native, API-first orchestration patterns** that enable teams to move from button-clicking to modular automation, essential for scaling toward Agentforce and multi-cloud integration.
 
@@ -70,7 +72,7 @@ This skill provides **GitHub-native, API-first orchestration patterns** that ena
 
 The `salesforce-alm-github` skill provides comprehensive ALM modernization capabilities:
 
-- **🚀 Five GitHub Actions Patterns**: Matrix Strategy, OIDC, Quick Deploy, Repository Dispatch, Custom Properties
+- **🚀 Seven GitHub Actions Patterns**: Matrix Strategy, JWT+Custom Properties (with optional Identity Broker), Quick Deploy, Repository Dispatch, Custom Properties Governance, Delta Deployments, Unlocked Packages
 - **🎯 Dual Operating Modes**: Advisory (workshop facilitation) + Implementation (actual workflow generation)
 - **🤖 Agentforce-Ready**: Prompt injection scanning, PII detection, grounding validation
 - **🏢 Enterprise Governance**: Custom Properties for SOX/HIPAA compliance, fine-grained access control
@@ -81,15 +83,17 @@ The `salesforce-alm-github` skill provides comprehensive ALM modernization capab
 
 ---
 
-## The Five GitHub Actions Superpowers
+## The Seven GitHub Actions Patterns
 
-These five patterns are unique capabilities that GitHub Enterprise provides over traditional declarative tools:
+These seven patterns are unique capabilities that GitHub Enterprise provides over traditional declarative tools:
 
 1. **Matrix Strategy**: Test across multiple Salesforce orgs simultaneously (3x faster than sequential)
-2. **OIDC + Custom Properties**: Zero-trust authentication with automatic governance enforcement
-3. **Quick Deploy Pattern**: Reuse validation results for 3-minute production deployments (vs 45 minutes)
+2. **Secure JWT + Custom Properties (with optional Identity Broker)**: JWT bearer flow gated by Custom Properties for governance, with an optional HashiCorp Vault / AWS STS / Azure Entra ID broker tier for true secretless auth. *(GitHub OIDC tokens are not natively trusted by Salesforce — a broker is required for OIDC-based auth.)*
+3. **Quick Deploy Pattern**: Reuse validation results for 3-minute production deployments (vs 45 minutes). ⚠️ Salesforce expires validations after 4 calendar days — fall back to a full deploy after that.
 4. **Repository Dispatch**: Cross-system testing coordination for multi-cloud architectures
-5. **Custom Properties for Governance**: Centralized repository classification with conditional quality gates
+5. **Custom Properties for Governance**: Centralized repository classification with conditional quality gates (read at runtime via `gh api`, not via `${{ vars.X }}`)
+6. **Delta Deployments**: Use `sfdx-git-delta` to deploy only changed metadata, collapsing 30-minute full deploys to under a minute
+7. **Unlocked Package Development**: Decompose a monolithic `force-app/` into versioned, independently installable packages — the Salesforce-recommended pattern for 20+ developer teams
 
 ---
 
@@ -240,7 +244,7 @@ Claude will generate a workflow with parallel testing configuration and time sav
 
 ---
 
-## The Five Patterns Explained
+## The Seven Patterns Explained
 
 ### Pattern 1: Matrix Strategy
 
@@ -248,7 +252,7 @@ Claude will generate a workflow with parallel testing configuration and time sav
 
 **Solution**: GitHub Actions matrix jobs run simultaneously.
 
-**Value**: 
+**Value**:
 - Test FSC, Health Cloud, Manufacturing Cloud in parallel
 - 3x faster than sequential (15 min vs 45 min)
 - Single workflow handles all org types
@@ -257,18 +261,20 @@ Claude will generate a workflow with parallel testing configuration and time sav
 
 ---
 
-### Pattern 2: OIDC with Custom Properties
+### Pattern 2: Secure JWT + Custom Properties (with optional Identity Broker)
 
-**Problem**: Long-lived secrets are risky and don't provide governance based on repository metadata.
+**Problem**: Long-lived secrets are risky and don't provide governance based on repository metadata. Most teams want "OIDC with Salesforce" but Salesforce **does not natively trust GitHub's OIDC issuer** — there is no out-of-the-box federation.
 
-**Solution**: GitHub OIDC authenticates without secrets, Custom Properties enforce governance at identity layer.
+**Solution (Tier 1)**: Salesforce JWT Bearer flow (which Salesforce *does* natively support), gated by a runtime Custom Properties check. Process-substituted private key — never written to disk. GitHub Environment with required reviewers as a second gate.
+
+**Solution (Tier 2, for zero-trust shops)**: Exchange the GitHub OIDC token for short-lived Salesforce credentials at an identity broker (HashiCorp Vault, AWS STS, or Azure Entra ID). Broker enforces `bound_claims` (repo, branch, environment) before returning credentials.
 
 **Value**:
-- No secrets to rotate or leak
-- Automatic enforcement: SOX-compliant repos can't access non-compliant orgs
-- Fine-grained access control without manual management
+- No long-lived `auth_url.txt` files written to runner disks
+- Automatic enforcement: non-compliant repos can't reach the secret
+- Tier 2: short-lived credentials (5–15 min TTL), no static secrets at all
 
-**Use When**: Enterprise environments, compliance requirements (SOX/HIPAA/PCI), GitHub Enterprise
+**Use When**: Enterprise environments, compliance requirements (SOX/HIPAA/PCI), GitHub Enterprise. Tier 1 covers 95% of teams; Tier 2 if you already operate a secrets broker.
 
 ---
 
@@ -276,14 +282,14 @@ Claude will generate a workflow with parallel testing configuration and time sav
 
 **Problem**: Salesforce deployments take 45+ minutes because Apex tests run during validation AND deployment.
 
-**Solution**: GitHub Artifacts pass validation Job ID from PR to production deployment workflow.
+**Solution**: GitHub Artifacts pass validation Job ID from PR to production deployment workflow. ⚠️ **Salesforce expires validations after 4 calendar days** — always include an age-based fallback to a full deploy.
 
 **Value**:
 - Reuse validation results instead of re-running tests
 - 45 min → 3 min production deployments
-- 434 hours saved per year (typical team)
+- Resilient to validation expiration via 72h pre-emptive fallback
 
-**Use When**: Large test suites, frequent deployments, teams prioritizing speed
+**Use When**: Large test suites, frequent deployments where merge happens within ~3 days of validation. For long-lived release branches, prefer Pattern 6.
 
 ---
 
@@ -306,11 +312,11 @@ Claude will generate a workflow with parallel testing configuration and time sav
 
 **Problem**: Different project types need different quality gates without duplicating workflows.
 
-**Solution**: Tag repositories with Custom Properties, use conditional workflow steps.
+**Solution**: Tag repositories with Custom Properties, read them at runtime via `gh api /repos/.../properties/values` (Custom Properties are **not** auto-exposed as `${{ vars.X }}`), and branch workflow logic on the values.
 
 **Value**:
 - Single workflow adapts to repository type
-- Agentforce repos automatically get security scanning
+- Agentforce repos automatically get structured metadata validation
 - SOX repos automatically get enhanced compliance checks
 - Scales to hundreds of repositories
 
@@ -318,41 +324,68 @@ Claude will generate a workflow with parallel testing configuration and time sav
 
 ---
 
+### Pattern 6: Delta Deployments with sfdx-git-delta
+
+**Problem**: Every push redeploys the entire `force-app/` directory, even when only 3 files changed. 30-minute deploys for 1-line changes; large blast radius.
+
+**Solution**: [`sfdx-git-delta`](https://github.com/scolladon/sfdx-git-delta) (sgd) diffs two git revisions and produces a `package.xml` + `destructiveChanges.xml` containing only what changed. Deploy just that subset.
+
+**Value**:
+- 30-minute full deploys collapse to under a minute
+- Blast radius proportional to the change
+- Pairs naturally with Quick Deploy and Pattern 5 governance gates
+
+**Caveat**: Requires `fetch-depth: 0` on `actions/checkout`. Run a periodic full-deploy to catch drift between git and the org.
+
+**Use When**: Mid-to-large orgs with frequent small deploys; teams hitting metadata API time limits.
+
+---
+
+### Pattern 7: Unlocked Package Development
+
+**Problem**: A monolithic `force-app/` directory shared by 30 developers means everyone steps on each other's metadata. Refactoring is terrifying. There's no way to roll back one team's feature without touching everyone's.
+
+**Solution**: Decompose the codebase into **unlocked packages** — versioned, independently installable bundles of metadata. Each package has its own directory, its own version history, and version-pinned dependencies. Created in a Dev Hub via `sf package version create`, installed via `sf package install`.
+
+**Value**:
+- True parallel work streams without merge conflicts
+- Per-team release cadences
+- Version-pinned dependencies shield consumers from breaking changes
+- The Salesforce-recommended pattern for large codebases
+
+**Caveat**: Decomposing an existing `force-app/` is a multi-week project. Some metadata types can't live in unlocked packages and must stay in a base-org deployment (see Salesforce metadata coverage).
+
+**Use When**: Teams of 20+ developers; multi-domain codebases; orgs scaling Agentforce across multiple agents/teams.
+
+---
+
 ## Agentforce-Specific Capabilities
 
-### Prompt Injection Scanning
+> **Reality check**: Real prompt-injection defense, PII masking, and toxicity filtering live in the runtime **Einstein Trust Layer**, not in CI. CI cannot evaluate prompts — only the model can. What CI *can* do is validate the metadata you ship before it ever reaches an org. This skill validates structural correctness; the Trust Layer validates runtime safety.
 
-Detects unsafe string concatenation and unsanitized user input in agent prompts:
+### Agent Metadata Schema Validation
 
-```bash
-# Scans for patterns like:
-String prompt = userInput + "...";  # UNSAFE
-```
+`scripts/validate-agentforce.sh` parses `.bot-meta.xml`, `.aiAuthoringBundle-meta.xml`, `.genAiPlugin-meta.xml`, and `.genAiPlanner-meta.xml` files using `xmllint` (XPath, not regex):
 
-### PII Exposure Detection
+- **Bot must have `<botVersions>`** — otherwise it deploys but cannot be activated.
+- **Plugin actions must declare `<permissionSetName>`** — otherwise actions run with the invoker's full permissions (least-privilege violation).
+- **Hard-coded secret detection in agent text** — extracts `<description>`, `<instructions>`, `<goal>` text and matches against API key / bearer token / Salesforce ID patterns. XML-aware to avoid false positives in unrelated metadata.
 
-Checks agent metadata files for hardcoded PII (SSN, credit cards, passport numbers):
+### Prompt Template Grounding Validation
 
-```bash
-# Fails build if PII found in .agent-meta.xml files
-```
+For `.genAiPromptTemplate-meta.xml`:
+- Flags templates that use `{!$Input.X}` user-driven variables but no `{!$Resource.X}`, `{!$Apex.X}`, `{!$Flow.X}`, or `{!$EinsteinPrompt.X}` grounding bindings — high injection risk.
 
-### Grounding Validation
+### Trust Layer Configuration Check
 
-Ensures proper LLM grounding implementation:
+If `Einstein.einsteinSettings-meta.xml` is in the project, fails the build if any of these are explicitly disabled:
+- `enableMasking`
+- `enableToxicityScoring`
+- `enablePromptInjectionDefense`
 
-```bash
-# Checks for @AuraEnabled grounding methods
-# Validates data source configuration
-```
+### Agent Behavioral Testing
 
-### Security Context Verification
-
-Validates "with sharing" usage in Apex classes used by agents:
-
-```bash
-# Ensures proper field-level security (FLS) enforcement
-```
+For *behavioral* tests (does the agent respond correctly?), this skill defers to the dedicated `testing-agentforce` skill, which wraps `sf agent test create/run` and AI Evaluation Definitions (`AiEvaluationDefinition` YAML).
 
 ---
 
@@ -363,7 +396,7 @@ Validates "with sharing" usage in Apex classes used by agents:
 | Capability | Declarative Tools | GitHub Actions |
 |------------|------------------|----------------|
 | Parallel testing | ❌ Sequential only | ✅ Matrix Strategy |
-| Secret management | ⚠️ Long-lived secrets | ✅ OIDC (no secrets) |
+| Secret management | ⚠️ Long-lived secrets | ✅ JWT + Custom Properties gate, or full identity broker (no static secrets) |
 | Deployment speed | ⚠️ 45+ min | ✅ 3 min (Quick Deploy) |
 | Cross-system coordination | ❌ Not supported | ✅ Repository Dispatch |
 | Repository-based governance | ❌ Not supported | ✅ Custom Properties |
@@ -390,8 +423,8 @@ Explain patterns, demonstrate value, provide migration guidance.
 
 **Example**:
 ```
-"I'm running an ALM workshop next week. What are the key talking points for the 
-five GitHub Actions patterns?"
+"I'm running an ALM workshop next week. What are the key talking points for the
+seven GitHub Actions patterns?"
 ```
 
 **Output**: Workshop materials, facilitation guide, ROI analysis, team concerns Q&A
@@ -413,33 +446,35 @@ Generate actual workflow files, configure repositories, set up authentication.
 
 ## Branch Strategies
 
-### Small Teams (1-5 developers)
+> **⚠️ Avoid GitFlow for Salesforce.** Long-lived `develop` and `release/*` branches accumulate metadata drift and produce merge conflicts that no human can reliably resolve. The right answer is shorter-lived branches and **packages**, not more branches.
+
+### Small Teams (1–5 developers)
 
 **Trunk-Based Development**
-- Direct commits to `main`
-- Short-lived feature branches
-- Validate on PR, quick deploy on merge
+- Single long-lived branch: `main`
+- Short-lived feature branches (hours to a few days, never weeks)
+- Validate on PR (Pattern 1), Quick Deploy on merge (Pattern 3)
+- Scratch orgs for feature dev with source tracking
 
 ---
 
-### Medium Teams (5-20 developers)
+### Medium Teams (5–20 developers)
 
-**GitHub Flow Variant**
-- `main` (production)
-- `develop` (integration)
-- `feature/*` (features)
-- `hotfix/*` (production fixes)
+**Trunk-Based + Environment Branches**
+- `main` is the source of truth, deploys to production
+- Optional **environment branches** for non-prod orgs (`env/uat`, `env/integration`) — these are *promotion targets*, not development branches
+- Feature branches still cut from `main`, merge back to `main`
+- Each environment branch reflects what's currently in that org, updated by automation, not by manual `git merge`
 
 ---
 
 ### Large Teams (20+ developers)
 
-**Gitflow with Release Branches**
-- `main` (production)
-- `release/*` (release candidates)
-- `develop` (integration)
-- `feature/*` (features)
-- `hotfix/*` (production fixes)
+**Unlocked Packages + Trunk Per Package** (see Pattern 7)
+- Decompose `force-app/` into versioned, independently installable packages
+- Each team owns one or more packages, works on `main`
+- Releases are package version bumps + install — no `develop`, no `release/*`
+- Built and promoted in a Dev Hub via `sf package version create` / `sf package version promote`
 
 ---
 

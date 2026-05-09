@@ -1,5 +1,6 @@
 {
   "skill_name": "salesforce-alm-github",
+  "version": "2.0.0",
   "evals": [
     {
       "id": 1,
@@ -10,10 +11,10 @@
         {"name": "Creates validate-pr workflow file", "description": "Should create a .github/workflows file for PR validation"},
         {"name": "Creates deploy-production workflow file", "description": "Should create a .github/workflows file for production deployment"},
         {"name": "Includes SF CLI installation", "description": "Workflows should install Salesforce CLI"},
-        {"name": "Includes authentication steps", "description": "Workflows should authenticate to Salesforce orgs"},
+        {"name": "Uses process substitution for auth secrets", "description": "Auth steps must use <(printf '%s' \"$SECRET\") and never write secrets to disk via echo > file. Negative: must NOT contain 'echo \"${{ secrets' followed by '> auth_url.txt' or '> jwt-key.txt'."},
         {"name": "Includes test execution", "description": "Workflows should run Apex tests"},
         {"name": "Provides setup documentation", "description": "Should include documentation on how to configure GitHub secrets"},
-        {"name": "Explains branch strategy", "description": "Documentation should explain the branch workflow (PR → main → deploy)"}
+        {"name": "Recommends trunk-based or environment-branch strategy", "description": "Branch strategy must NOT recommend GitFlow with develop/release branches. Should recommend trunk-based (small/medium teams) or unlocked packages (large teams)."}
       ]
     },
     {
@@ -26,52 +27,121 @@
         {"name": "Defines all three org types in matrix", "description": "Matrix should include FSC, Health Cloud, and Enterprise Edition"},
         {"name": "Deploys to all orgs in parallel", "description": "Workflow should trigger parallel jobs for each org"},
         {"name": "Explains time savings", "description": "Documentation should explain parallel vs sequential deployment time benefits"},
-        {"name": "Includes authentication for multiple orgs", "description": "Should explain how to set up secrets for each org"},
+        {"name": "Includes authentication for multiple orgs", "description": "Should explain how to set up secrets for each org, using process substitution rather than writing to disk"},
         {"name": "References Pattern 1 from skill", "description": "Should demonstrate the Matrix Strategy pattern from the skill"}
       ]
     },
     {
       "id": 3,
       "prompt": "Our compliance team says we need better governance for our Salesforce deployments. We have some repos that are SOX-compliant and need extra controls, and we're starting to build Agentforce agents which need security scanning for prompt injections. Can GitHub help with this? We have GitHub Enterprise.",
-      "expected_output": "Implementation using GitHub Custom Properties for compliance tiers and agentforce-enabled flags, with conditional workflows that enforce SOX compliance checks and Agentforce-specific security scanning (prompt injection detection, grounding validation, PII checks).",
+      "expected_output": "Implementation using GitHub Custom Properties for compliance tiers and agentforce-enabled flags, with conditional workflows that enforce SOX compliance checks and Agentforce metadata validation. Should clearly distinguish between deploy-time validation (which CI can do) and runtime safety (which the Einstein Trust Layer handles).",
       "files": [],
       "assertions": [
-        {"name": "Uses GitHub Custom Properties", "description": "Solution should leverage Custom Properties for compliance-tier and agentforce-enabled"},
+        {"name": "Uses GitHub Custom Properties via gh api", "description": "Solution should leverage Custom Properties for compliance-tier and agentforce-enabled, read at runtime via 'gh api /repos/.../properties/values' — NOT via ${{ vars.X }} which only works for repo/org Variables"},
         {"name": "Implements conditional workflows based on properties", "description": "Workflows should have conditional steps based on repository custom properties"},
         {"name": "Includes SOX compliance checks", "description": "Should implement enhanced controls for SOX-compliant repositories"},
-        {"name": "Includes Agentforce security scanning", "description": "Should scan for prompt injection vulnerabilities in Agentforce code"},
-        {"name": "Checks for PII exposure in agents", "description": "Should validate that agent metadata doesn't contain PII"},
-        {"name": "Validates LLM grounding implementation", "description": "Should check for proper grounding methods in Agentforce agents"},
+        {"name": "Uses structured XML validation for Agentforce, not regex grep", "description": "Agentforce validation must use xmllint or yq against agent metadata XML — NOT regex grep for keywords like 'prompt' or 'ssn'. Negative: must NOT contain 'grep -r \"user.*input.*prompt\"' or similar grep-based 'prompt injection scanning'."},
+        {"name": "Distinguishes CI validation from Trust Layer runtime", "description": "Documentation must clarify that real prompt injection defense is the Einstein Trust Layer at runtime, and CI only validates structural correctness of agent metadata"},
+        {"name": "Validates Trust Layer settings if present", "description": "Should check Einstein.einsteinSettings-meta.xml for explicitly disabled protections (enableMasking, enableToxicityScoring, enablePromptInjectionDefense)"},
+        {"name": "Validates plugin permission set scoping", "description": "Should check that genAiPlugin metadata with action references also declares <permissionSetName>"},
         {"name": "Explains GitHub Enterprise governance features", "description": "Documentation should explain how GitHub Enterprise provides governance capabilities"}
       ]
     },
     {
       "id": 4,
       "prompt": "Our production deployments take 45 minutes because we have to run all the Apex tests again even though we already validated them on the PR. Is there a way to speed this up?",
-      "expected_output": "Quick Deploy pattern using GitHub Artifacts to pass validation job IDs between workflows, with explanation of how this reduces deployment time from 45 minutes to ~3 minutes by reusing validation results.",
+      "expected_output": "Quick Deploy pattern using GitHub Artifacts to pass validation job IDs between workflows, with explicit warning about Salesforce's 4-day validation expiration window and a working fallback to full deploy.",
       "files": [],
       "assertions": [
         {"name": "Uses GitHub Artifacts for job ID passing", "description": "Should use actions/upload-artifact and actions/download-artifact"},
         {"name": "Captures validation job ID", "description": "PR validation workflow should save the Salesforce validation job ID"},
         {"name": "Uses sf project deploy quick command", "description": "Production deployment should use 'sf project deploy quick --job-id'"},
-        {"name": "Explains time savings (45 min to 3-5 min)", "description": "Documentation should highlight the dramatic time reduction"},
-        {"name": "Includes fallback to full deployment", "description": "Should handle cases where artifact is missing or expired"},
+        {"name": "Warns about 4-day Salesforce validation expiration", "description": "MUST explicitly call out that Salesforce-side validation results expire after 4 calendar days, regardless of GitHub artifact retention. Without this warning, teams will hit confusing 'Validation Id is invalid' errors."},
+        {"name": "Includes age-aware fallback to full deployment", "description": "Should include logic to check validation age (preferably with a buffer like 72h) and fall back to full RunLocalTests deploy if expired or artifact missing"},
         {"name": "References Pattern 3 from skill", "description": "Should demonstrate the Quick Deploy pattern from the skill"}
       ]
     },
     {
       "id": 5,
       "prompt": "I'm running an ALM workshop next week for our Salesforce team. They're used to clicking buttons to deploy and they're nervous about the move to GitHub Actions. What are the key talking points I should cover to show them why this is better? Especially for our move toward Agentforce.",
-      "expected_output": "Workshop facilitation guidance covering all five GitHub Actions patterns with business value propositions, concrete time/cost savings examples, comparison to declarative tools (without naming specific vendors), and emphasis on Agentforce readiness and multi-cloud scaling. Should include talking points about increased visibility, better governance, and modern orchestration.",
+      "expected_output": "Workshop facilitation guidance covering all GitHub Actions patterns (Matrix, JWT+CustomProperties governance, Quick Deploy, Repository Dispatch, Conditional Properties, Delta Deployments, Unlocked Packages) with business value propositions, concrete time/cost savings examples, comparison to declarative tools (without naming specific vendors), and emphasis on Agentforce readiness and multi-cloud scaling.",
       "files": [],
       "assertions": [
-        {"name": "Covers all five GitHub Actions patterns", "description": "Should discuss Matrix Strategy, OIDC, Quick Deploy, Repository Dispatch, and Custom Properties"},
+        {"name": "Covers core GitHub Actions patterns", "description": "Should discuss at minimum: Matrix Strategy, JWT+Custom Properties governance, Quick Deploy, Repository Dispatch, and Custom Properties — and ideally also Delta Deployments and Unlocked Packages"},
         {"name": "Addresses team nervousness about change", "description": "Should acknowledge concerns and provide reassurance about the transition"},
-        {"name": "Explains Agentforce-specific benefits", "description": "Should highlight why modern ALM is essential for Agentforce (multi-cloud, rapid iteration, security)"},
+        {"name": "Explains Agentforce-specific benefits honestly", "description": "Should highlight why modern ALM matters for Agentforce. Must NOT overpromise that CI 'scans for prompt injection' — that's a Trust Layer runtime concern, not CI."},
         {"name": "Provides concrete time/cost savings examples", "description": "Should include specific metrics demonstrating ROI"},
         {"name": "Avoids naming specific vendor tools", "description": "Should not mention Copado or other specific declarative tools by name"},
         {"name": "Emphasizes API-first orchestration", "description": "Should frame GitHub Actions as modern, API-first approach vs button-clicking"},
         {"name": "Includes workshop structure or agenda", "description": "Should provide a structured approach for conducting the workshop"}
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "Our prod deployments are slow because every push redeploys our entire force-app/ directory even though only a few files changed. Can we deploy just the diff?",
+      "expected_output": "Delta deployment pattern using sfdx-git-delta (sgd) plugin to diff git revisions and produce a metadata-only delta package, with explanation of when delta deploys are appropriate and the need for periodic full-deploy reconciliation.",
+      "files": [],
+      "assertions": [
+        {"name": "Uses sfdx-git-delta plugin", "description": "Should install and use 'sf plugins install sfdx-git-delta' and 'sf sgd source delta'"},
+        {"name": "Specifies fetch-depth: 0 in checkout", "description": "actions/checkout step must include 'fetch-depth: 0' because sgd needs full git history to compute the diff"},
+        {"name": "Handles destructive changes separately", "description": "Should account for sgd emitting destructiveChanges.xml separately from package.xml and deploy them via --pre-destructive-changes or --post-destructive-changes"},
+        {"name": "Uses --from and --to revision arguments", "description": "Should pass appropriate git refs (e.g. github.event.before to HEAD) to sgd"},
+        {"name": "Warns about drift requiring periodic full deploys", "description": "Should explicitly note that delta deploys do not catch manual changes made directly in the org, and recommend a periodic full-deploy reconciliation"},
+        {"name": "References Pattern 6 from skill", "description": "Should demonstrate the Delta Deployments pattern"}
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "We have 30 developers and they're stepping all over each other's metadata. Refactoring is terrifying. How should we organize our Salesforce codebase for this kind of scale?",
+      "expected_output": "Recommendation for unlocked package decomposition with per-team package ownership, version-pinned dependencies, and trunk-based development per package. Should NOT recommend GitFlow.",
+      "files": [],
+      "assertions": [
+        {"name": "Recommends unlocked packages, not GitFlow", "description": "Solution must center on Salesforce unlocked packages with per-package directories in sfdx-project.json, NOT on long-lived develop/release branches"},
+        {"name": "Shows sfdx-project.json with multiple packageDirectories", "description": "Example should illustrate multiple packageDirectories entries with version dependencies"},
+        {"name": "Explains version-pinned dependencies", "description": "Should explain that 'Core@1.0.0-1' pins to a specific immutable version and shields downstream packages from breaking changes"},
+        {"name": "Recommends Dev Hub-based package version creation", "description": "Should explain that 'sf package version create' runs against a Dev Hub org, with --code-coverage enforcing 75% coverage at build time"},
+        {"name": "Explains promotion of versions", "description": "Should explain that promoted versions are immutable and a prerequisite for production install"},
+        {"name": "Acknowledges decomposition cost", "description": "Should note that decomposing an existing force-app into packages is a multi-week project, not an afternoon"},
+        {"name": "References Pattern 7 from skill", "description": "Should demonstrate the Unlocked Package Development pattern"}
+      ]
+    },
+    {
+      "id": 8,
+      "prompt": "We want zero-trust authentication to Salesforce — no static secrets in GitHub. We already use HashiCorp Vault. Can we use GitHub OIDC?",
+      "expected_output": "Identity broker pattern using GitHub OIDC to authenticate to Vault, with Vault's bound_claims enforcing repo/branch/environment restrictions, Vault returning short-lived Salesforce credentials. Must NOT claim that Salesforce natively trusts GitHub OIDC.",
+      "files": [],
+      "assertions": [
+        {"name": "Acknowledges Salesforce does not natively trust GitHub OIDC", "description": "Must explicitly state that there is no native federation between GitHub OIDC issuer and Salesforce, and a broker is required for true OIDC-based auth"},
+        {"name": "Uses hashicorp/vault-action for OIDC->Vault auth", "description": "Should use the official Vault GitHub Action with method: jwt and a configured role"},
+        {"name": "Configures Vault role with bound_claims", "description": "Vault role config should bind specific JWT claims (repository, ref, environment) to gate access"},
+        {"name": "Uses short-lived token TTL", "description": "Should set a small token_ttl (e.g. 5-15 minutes) on the Vault role"},
+        {"name": "Authenticates to Salesforce via JWT after broker exchange", "description": "After fetching credentials from Vault, should use sf org login jwt with process-substituted private key"},
+        {"name": "Mentions AWS STS and Azure as alternative brokers", "description": "Should briefly acknowledge that aws-actions/configure-aws-credentials and azure/login are equivalent broker patterns"},
+        {"name": "References Pattern 2 Tier 2 from skill", "description": "Should demonstrate the Tier 2 Identity Broker variant of Pattern 2"}
+      ]
+    },
+    {
+      "id": 9,
+      "prompt": "I want to enforce a code coverage gate of 80% in my PR validation workflow. How do I parse the result correctly?",
+      "expected_output": "Working code coverage extraction from sf apex run test --json output that handles the actual JSON shape (numeric percentage, no '%' suffix), uses --synchronous to get inline coverage, and validates against a configurable threshold.",
+      "files": [],
+      "assertions": [
+        {"name": "Uses sf apex run test --json --synchronous", "description": "Should run tests with --json --synchronous so coverage is in the result inline, not requiring a separate sf apex get test call"},
+        {"name": "Parses testRunCoverage as numeric, not string", "description": "Must NOT include 'tr -d \\\"' or 'cut -d% -f1' to strip a '%' character that does not exist in the JSON. testRunCoverage is a numeric percentage."},
+        {"name": "Captures output file for downstream parsing", "description": "Should redirect JSON to a file (e.g. test-results/run.json) and parse with jq, so the result is reusable across steps"},
+        {"name": "Uses awk or jq for floating-point comparison, not bare bash", "description": "Bash cannot do floating-point comparison without bc/awk. Should use awk or jq for the threshold check."},
+        {"name": "Threshold is configurable via repo variable", "description": "Required coverage should default to 75 but be overridable via vars.TEST_COVERAGE_REQUIRED"}
+      ]
+    },
+    {
+      "id": 10,
+      "prompt": "I see references to sfdx-scanner in some old workflows. Is that still the right tool?",
+      "expected_output": "Direction to migrate from the deprecated sfdx-scanner plugin to Salesforce Code Analyzer (@salesforce/plugin-code-analyzer / sf code-analyzer run).",
+      "files": [],
+      "assertions": [
+        {"name": "States that sfdx-scanner is deprecated", "description": "Should explicitly note that the @salesforce/sfdx-scanner plugin and 'sfdx scanner:run' command are deprecated"},
+        {"name": "Recommends @salesforce/plugin-code-analyzer", "description": "Replacement should be 'npm install -g @salesforce/plugin-code-analyzer' and 'sf code-analyzer run'"},
+        {"name": "Uses --rule-selector and --severity-threshold", "description": "Example invocation should use the modern flags: --workspace, --rule-selector, --severity-threshold, --output-file"}
       ]
     }
   ]
