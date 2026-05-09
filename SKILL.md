@@ -69,8 +69,10 @@ jobs:
       
       - name: Authenticate to ${{ matrix.org_alias }}
         run: |
-          echo "${{ secrets[format('SFDX_AUTH_URL_{0}', matrix.org_alias)] }}" > auth_url.txt
-          sf org login sfdx-url --sfdx-url-file auth_url.txt --alias ${{ matrix.org_alias }}
+          # Process substitution avoids writing the auth URL to disk
+          sf org login sfdx-url \
+            --sfdx-url-file <(printf '%s' "${{ secrets[format('SFDX_AUTH_URL_{0}', matrix.org_alias)] }}") \
+            --alias ${{ matrix.org_alias }}
       
       - name: Deploy and Test
         run: |
@@ -82,68 +84,194 @@ jobs:
 
 **When to use**: Users need to test across multiple orgs, multiple Salesforce editions, or multiple API versions simultaneously.
 
-### Pattern 2: OIDC (OpenID Connect) with Custom Properties
+### Pattern 2: Secure JWT + Custom Properties (with optional Identity Broker)
 
-**The Problem**: Managing long-lived secrets (SFDX Auth URLs, certificates) is risky and doesn't provide fine-grained governance based on repository metadata.
+**The Problem**: Managing long-lived secrets (SFDX Auth URLs, certificates) is risky and doesn't provide fine-grained governance based on repository metadata. Most teams want "OIDC with Salesforce" but Salesforce **does not natively trust GitHub's OIDC issuer** — there is no out-of-the-box federation between `token.actions.githubusercontent.com` and a Salesforce Connected App.
 
-**The Solution**: Use GitHub OIDC to authenticate without secrets, combined with Custom Properties as claims to enforce governance at the identity layer.
+**The Solution**: Use Salesforce JWT Bearer flow (which Salesforce *does* natively support) with the JWT private key stored as a GitHub secret, and use **Custom Properties as a governance gate** that runs *before* the secret is ever accessed. For teams that need true secretless deployment, exchange the GitHub OIDC token for short-lived Salesforce credentials at an identity broker (HashiCorp Vault, AWS STS, or Azure Entra ID).
 
-**Workshop Value**: "We can use Custom Properties (e.g., `compliance-tier: SOX`) as claims in our OIDC tokens. If a repository isn't tagged as 'SOX compliant' in GitHub, it literally cannot access the Production Salesforce secret."
+**Workshop Value**: "We use Custom Properties (e.g., `compliance-tier: SOX`) as a *gate* before the workflow can access production secrets. If a repository isn't tagged 'SOX compliant' in GitHub, the job fails before authentication is even attempted. For shops with a secrets broker, we exchange GitHub's OIDC token for short-lived Salesforce credentials — no static secrets at all."
+
+#### Tier 1 (Recommended for Most Teams): JWT + Custom Properties Gate
+
+This is the pattern 95% of enterprises actually deploy. It's secure, works today, and requires no broker infrastructure.
 
 **Implementation Steps**:
 
 1. **Configure Custom Properties in GitHub Enterprise**:
    - Navigate to Organization Settings → Custom Properties
    - Create properties like:
-     - `compliance-tier` (options: SOX, HIPAA, PCI, Standard)
-     - `agentforce-enabled` (boolean)
-     - `deployment-tier` (options: dev, qa, staging, production)
+     - `compliance-tier` (single-select: `SOX`, `HIPAA`, `PCI`, `Standard`)
+     - `agentforce-enabled` (true/false)
+     - `deployment-tier` (single-select: `dev`, `qa`, `staging`, `production`)
 
-2. **Set up Connected App in Salesforce**:
-   - Create a Connected App with OAuth settings
-   - Enable "Use digital signatures"
-   - Configure callback URL for GitHub Actions
-   - Note the Consumer Key and Consumer Secret
+2. **Expose Custom Properties to workflows**: Custom Properties are **not** automatically available as `${{ vars.X }}`. You must read them via the GitHub API at workflow runtime. This step is commonly missed.
 
-3. **Create GitHub OIDC Workflow**:
+3. **Set up the Salesforce Connected App** (one-time, per target org):
+   - Setup → App Manager → New Connected App
+   - Enable OAuth Settings → "Use digital signatures" → upload the public key (`server.crt`)
+   - Add OAuth scopes: `api`, `refresh_token`, `web`
+   - Save → record the **Consumer Key** (a.k.a. Client ID)
+   - On the Connected App's manage page → set "Permitted Users" to "Admin approved users are pre-authorized"
+   - Pre-authorize via a Permission Set assigned to the integration user
+
+4. **Store secrets in GitHub** (per environment):
+   - `SF_CONSUMER_KEY_PROD` — Connected App Consumer Key
+   - `SF_JWT_KEY_PROD` — The matching `server.key` (PEM-format private key)
+   - `SF_USERNAME_PROD` — The integration user's username
+
+5. **Create the workflow**:
+```yaml
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  governance-gate:
+    runs-on: ubuntu-latest
+    outputs:
+      compliance_tier: ${{ steps.props.outputs.compliance_tier }}
+      agentforce_enabled: ${{ steps.props.outputs.agentforce_enabled }}
+    steps:
+      - name: Read repository custom properties
+        id: props
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Custom Properties are exposed via the REST API, not as workflow vars
+          PROPS=$(gh api "/repos/${{ github.repository }}/properties/values" --jq '.[]')
+          COMPLIANCE_TIER=$(echo "$PROPS" | jq -r 'select(.property_name=="compliance-tier") | .value')
+          AGENTFORCE=$(echo "$PROPS" | jq -r 'select(.property_name=="agentforce-enabled") | .value')
+
+          echo "compliance_tier=${COMPLIANCE_TIER:-Standard}" >> "$GITHUB_OUTPUT"
+          echo "agentforce_enabled=${AGENTFORCE:-false}" >> "$GITHUB_OUTPUT"
+
+      - name: Enforce compliance gate
+        run: |
+          if [[ "${{ steps.props.outputs.compliance_tier }}" != "SOX" ]]; then
+            echo "❌ Repository not tagged as SOX-compliant. Production deploys require compliance-tier=SOX."
+            echo "Set it: Repo Settings → Custom Properties → compliance-tier"
+            exit 1
+          fi
+          echo "✅ Compliance gate passed"
+
+  deploy:
+    needs: governance-gate
+    runs-on: ubuntu-latest
+    environment: production  # GitHub Environment with required reviewers + branch protection
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SF CLI
+        run: npm install -g @salesforce/cli@latest
+
+      - name: Authenticate via JWT Bearer Flow
+        run: |
+          sf org login jwt \
+            --client-id "${{ secrets.SF_CONSUMER_KEY_PROD }}" \
+            --jwt-key-file <(printf '%s' "${{ secrets.SF_JWT_KEY_PROD }}") \
+            --username "${{ secrets.SF_USERNAME_PROD }}" \
+            --instance-url https://login.salesforce.com \
+            --alias production
+
+      - name: Deploy
+        run: sf project deploy start --target-org production --wait 60
+```
+
+**Why this works**:
+- The governance gate runs **before** the deploy job — and the deploy job is only granted access to production secrets via the GitHub `environment: production`. No compliance tag → no deploy.
+- JWT Bearer is Salesforce's native server-to-server auth — no broker required.
+- The private key is never written to disk (`<(printf '%s' ...)`), avoiding leakage through logs, caches, or artifacts.
+- `gh api` reads Custom Properties dynamically at runtime, so re-tagging a repo takes effect immediately without rotating any secret.
+
+#### Tier 2 (For Zero-Trust Shops): GitHub OIDC → Identity Broker → Salesforce
+
+If you have a secrets broker that already federates with GitHub OIDC (HashiCorp Vault, AWS Secrets Manager via STS, Azure Key Vault via Entra ID, or CyberArk), you can eliminate the long-lived JWT private key entirely. The broker holds the Salesforce JWT key, validates the GitHub OIDC token's claims (including Custom Property claims if your IdP enriches them), and returns short-lived Salesforce credentials.
+
+**Architecture**:
+```
+GitHub Actions ──OIDC token──▶ Identity Broker ──validates claims──▶ Returns SF JWT/access_token
+                  (audience:                       (repo, branch,         (short-lived)
+                   broker-specific)                 environment,
+                                                    custom claims)
+```
+
+**Example: HashiCorp Vault as broker**:
 ```yaml
 jobs:
   deploy:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
+      id-token: write   # Required for OIDC token request
       contents: read
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Validate Repository Compliance
-        run: |
-          # GitHub provides custom properties via API
-          COMPLIANCE_TIER="${{ vars.COMPLIANCE_TIER }}"
-          if [[ "$COMPLIANCE_TIER" != "SOX" ]]; then
-            echo "❌ Repository not SOX compliant. Cannot deploy to production."
-            exit 1
-          fi
-      
-      - name: Get OIDC Token
-        id: oidc
-        run: |
-          OIDC_TOKEN=$(curl -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=salesforce" | jq -r .value)
-          echo "::add-mask::$OIDC_TOKEN"
-          echo "token=$OIDC_TOKEN" >> $GITHUB_OUTPUT
-      
-      - name: Authenticate to Salesforce via OIDC
+
+      - name: Authenticate to Vault via GitHub OIDC
+        id: vault
+        uses: hashicorp/vault-action@v3
+        with:
+          url: https://vault.example.com
+          method: jwt
+          role: salesforce-prod-deployer
+          jwtGithubAudience: vault.example.com
+          secrets: |
+            secret/salesforce/prod consumer_key | SF_CONSUMER_KEY ;
+            secret/salesforce/prod jwt_private_key | SF_JWT_KEY ;
+            secret/salesforce/prod username | SF_USERNAME
+
+      - name: Authenticate to Salesforce
         run: |
           sf org login jwt \
-            --client-id ${{ secrets.SF_CONSUMER_KEY }} \
-            --jwt-key-file <(echo "${{ secrets.SF_JWT_KEY }}") \
-            --username ${{ secrets.SF_USERNAME }} \
+            --client-id "$SF_CONSUMER_KEY" \
+            --jwt-key-file <(printf '%s' "$SF_JWT_KEY") \
+            --username "$SF_USERNAME" \
             --instance-url https://login.salesforce.com \
             --alias production
 ```
 
-**When to use**: Users need fine-grained access control, compliance enforcement, or want to eliminate long-lived secrets from their deployment pipelines.
+The Vault role `salesforce-prod-deployer` is configured to bind specific JWT claims to access:
+```hcl
+# Vault config (one-time setup)
+resource "vault_jwt_auth_backend_role" "sf_prod" {
+  backend         = vault_jwt_auth_backend.github.path
+  role_name       = "salesforce-prod-deployer"
+  bound_audiences = ["vault.example.com"]
+  bound_claims = {
+    repository       = "your-org/salesforce-repo"
+    ref              = "refs/heads/main"
+    environment      = "production"
+  }
+  user_claim    = "actor"
+  token_policies = ["salesforce-prod-read"]
+  token_ttl     = 900   # 15 minutes
+}
+```
+
+**AWS STS variant**: Use `aws-actions/configure-aws-credentials@v4` with `role-to-assume`, then read the SF private key from AWS Secrets Manager. Same principle.
+
+**Azure variant**: Use `azure/login@v2` with `client-id` (Federated Credentials), then read the SF private key from Key Vault.
+
+**Key Points**:
+- The broker — not GitHub — enforces `bound_claims`. This is real zero-trust: the broker won't return Salesforce credentials unless every claim matches.
+- The GitHub OIDC token never reaches Salesforce; only the broker sees it.
+- Token TTL of 5–15 minutes is typical, eliminating long-lived secret risk.
+- Custom Properties can be enriched into OIDC claims via your IdP if your broker supports custom claim mapping (Vault and Entra ID do; AWS STS only sees the claims GitHub natively emits).
+
+**When to use Tier 2**: You already operate a secrets broker, security mandates "no static secrets," or you need cross-environment claim enforcement (e.g., dev repos cannot reach prod even if a key leaks).
+
+**When to use Tier 1**: You don't have a broker, or you want to ship this week. Tier 1 with a strict Custom Properties gate + GitHub Environment protection rules is enterprise-grade for the vast majority of teams.
+
+#### Common gotchas
+
+- **Custom Properties are not workflow vars.** `${{ vars.COMPLIANCE_TIER }}` only works for Repository or Organization Variables, not Custom Properties. Use `gh api /repos/.../properties/values` as shown above.
+- **JWT key format matters.** The `server.key` must be the PEM-format private key (begins with `-----BEGIN RSA PRIVATE KEY-----` or `-----BEGIN PRIVATE KEY-----`). Paste the entire block including header/footer into the secret.
+- **Connected App pre-authorization is mandatory.** "Admin approved users are pre-authorized" + a Permission Set on the integration user. Without this, JWT Bearer returns `user hasn't approved this consumer`.
+- **Use GitHub Environments, not just secrets.** An Environment with required reviewers + branch protection is the difference between "anyone with write access can deploy to prod" and "deploys require explicit approval."
+
+**When to use Pattern 2**: Users need fine-grained access control, compliance enforcement, or want to eliminate (or reduce) long-lived secrets from their deployment pipelines.
 
 ### Pattern 3: Artifact Job-ID Passing (Quick Deploy Pattern)
 
@@ -174,8 +302,9 @@ jobs:
       
       - name: Authenticate to Production
         run: |
-          echo "${{ secrets.SFDX_AUTH_URL_PROD }}" > auth_url.txt
-          sf org login sfdx-url --sfdx-url-file auth_url.txt --alias production
+          sf org login sfdx-url \
+            --sfdx-url-file <(printf '%s' "${{ secrets.SFDX_AUTH_URL_PROD }}") \
+            --alias production
       
       - name: Run Validation
         id: validation
@@ -235,8 +364,9 @@ jobs:
       
       - name: Authenticate to Production
         run: |
-          echo "${{ secrets.SFDX_AUTH_URL_PROD }}" > auth_url.txt
-          sf org login sfdx-url --sfdx-url-file auth_url.txt --alias production
+          sf org login sfdx-url \
+            --sfdx-url-file <(printf '%s' "${{ secrets.SFDX_AUTH_URL_PROD }}") \
+            --alias production
       
       - name: Quick Deploy Using Job ID
         run: |
@@ -255,11 +385,49 @@ jobs:
 ```
 
 **Key Points**:
-- The artifact retention ensures the Job ID is available for 30 days
-- If the artifact is missing (e.g., expired), fall back to a full deployment
-- This pattern works across workflow files and workflow runs
+- The artifact retention ensures the Job ID is **available to GitHub** for up to 30 days.
+- ⚠️ **Salesforce-side validations expire after 4 days, not 30.** A `validatedDeployRequestId` is only eligible for Quick Deploy for 4 calendar days from the moment validation succeeded. After that, `sf project deploy quick --job-id $JOB_ID` will fail with `INVALID_ID_FIELD: Validation Id ... is invalid` even if the artifact is still in GitHub. Source: [Salesforce: Quick Deploy a Validation](https://developer.salesforce.com/docs/atlas.en-us.deployment.meta/deployment/deploy_quick.htm).
+- If the validation is older than 4 days (e.g., a long-lived PR, a holiday weekend, a stuck approval), fall back to a full deployment with `RunLocalTests`.
+- The fallback below treats both "artifact missing" and "Salesforce rejected the Job ID" as the same recovery path — both mean "validation no longer reusable, deploy fresh."
+- Tag the artifact with the validation timestamp so the consumer workflow can pre-emptively skip Quick Deploy if it's been more than 3 days (gives you a margin before the 4-day cliff):
 
-**When to use**: Users want to optimize deployment speed, reduce test execution time, or implement a validation → promotion workflow.
+```yaml
+- name: Tag artifact with validation age
+  run: |
+    echo "$(date -u +%s)" > validation_timestamp.txt
+- name: Upload Job ID + timestamp
+  uses: actions/upload-artifact@v4
+  with:
+    name: validation-job-id
+    path: |
+      validation_job_id.txt
+      validation_timestamp.txt
+    retention-days: 7   # Match Salesforce's 4-day cliff with a small buffer; longer is misleading
+```
+
+```yaml
+# In the deploy workflow, before attempting Quick Deploy:
+- name: Check validation age
+  id: age
+  run: |
+    AGE_SEC=$(( $(date -u +%s) - $(cat validation_timestamp.txt) ))
+    AGE_HOURS=$(( AGE_SEC / 3600 ))
+    echo "age_hours=$AGE_HOURS" >> "$GITHUB_OUTPUT"
+    if (( AGE_HOURS > 72 )); then
+      echo "⚠️  Validation is ${AGE_HOURS}h old (>72h). Salesforce expires Quick Deploy at 96h. Falling back to full deploy."
+      echo "expired=true" >> "$GITHUB_OUTPUT"
+    fi
+
+- name: Quick Deploy
+  if: steps.age.outputs.expired != 'true'
+  run: sf project deploy quick --job-id "$(cat validation_job_id.txt)" --target-org production --wait 10
+
+- name: Full Deploy (fallback)
+  if: steps.age.outputs.expired == 'true' || failure()
+  run: sf project deploy start --target-org production --test-level RunLocalTests --wait 60
+```
+
+**When to use**: Users want to optimize deployment speed, reduce test execution time, or implement a validation → promotion workflow. The pattern shines when validations and merges are close together (same day, same week). For long-lived release branches, prefer Pattern 6 (Delta Deployments).
 
 ### Pattern 4: Repository Dispatch (System Handshake)
 
@@ -332,8 +500,9 @@ jobs:
       
       - name: Authenticate to Salesforce
         run: |
-          echo "${{ secrets.SFDX_AUTH_URL_PROD }}" > auth_url.txt
-          sf org login sfdx-url --sfdx-url-file auth_url.txt --alias production
+          sf org login sfdx-url \
+            --sfdx-url-file <(printf '%s' "${{ secrets.SFDX_AUTH_URL_PROD }}") \
+            --alias production
       
       - name: Run Integration Tests
         run: |
@@ -417,27 +586,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Standard Security Scan
+      - name: Standard Security Scan (Salesforce Code Analyzer)
         run: |
-          npm install -g @salesforce/sfdx-scanner
-          sfdx scanner:run --target "force-app/**/*.cls" --format sarif --outfile results.sarif
+          # Salesforce Code Analyzer v5+ replaces the deprecated sfdx-scanner plugin.
+          # https://developer.salesforce.com/docs/platform/salesforce-code-analyzer/overview
+          npm install -g @salesforce/plugin-code-analyzer
+          sf code-analyzer run \
+            --workspace "force-app/**/*.cls" \
+            --rule-selector "Security:Recommended,BestPractices:Recommended" \
+            --output-file results.sarif \
+            --severity-threshold 3
       
-      - name: Agentforce-Specific Security Scan
+      - name: Agentforce metadata validation
         if: needs.setup.outputs.agentforce_enabled == 'true'
         run: |
-          echo "🤖 Running Agentforce security checks..."
-          
-          # Check for prompt injection vulnerabilities
-          echo "Scanning for prompt injection patterns..."
-          grep -r "user.*input.*prompt" force-app/ || echo "No prompt injection risks found"
-          
-          # Check for proper grounding implementation
-          echo "Validating LLM grounding implementation..."
-          grep -r "@AuraEnabled.*grounding" force-app/ || echo "Warning: No grounding methods found"
-          
-          # Check for data privacy in AI context
-          echo "Checking for PII in agent instructions..."
-          # Add your custom Agentforce security logic here
+          echo "🤖 Running Agentforce metadata validation..."
+          # See "Agentforce-Specific Considerations" below for the full validator script.
+          # This step calls scripts/validate-agentforce.sh which performs structured XML
+          # validation, not regex scanning. It exits non-zero on any policy violation.
+          bash scripts/validate-agentforce.sh
 
   compliance-checks:
     needs: setup
@@ -500,34 +667,359 @@ jobs:
 
 **When to use**: Users manage multiple Salesforce projects with different requirements, need centralized governance, or want to enforce Agentforce-specific security standards.
 
+### Pattern 6: Delta Deployments with sfdx-git-delta
+
+**The Problem**: Every deployment redeploys the entire `force-app/` directory, even when only 3 files changed. On a large org, this means 30–60 minutes of metadata API churn for a one-line Apex tweak. It also means every deployment touches every component, increasing risk of incidental drift.
+
+**The Solution**: [`sfdx-git-delta`](https://github.com/scolladon/sfdx-git-delta) (sgd) is a community plugin that diffs two git revisions and produces a `package.xml` + a `destructiveChanges.xml` containing **only the metadata that changed**. You then deploy just that subset. A 5-minute typical full deploy collapses to under a minute.
+
+**Workshop Value**: "We deploy what changed, not what exists. A typo fix in one Apex class shouldn't redeploy 400 Lightning components, 50 flows, and every permission set the org has ever seen. Delta deployments let us ship in seconds and keep the blast radius proportional to the change."
+
+**Why this isn't built into SF CLI**: Salesforce's `sf project deploy start` doesn't natively understand "what changed since this git ref" — it understands "what's in this directory." `sgd` bridges that gap by running the git diff for you and emitting the `package.xml` that the metadata API expects.
+
+**Implementation**:
+
+```yaml
+name: Delta Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  delta-deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Required: sgd needs full git history to diff against the base ref
+
+      - name: Install SF CLI + sfdx-git-delta
+        run: |
+          npm install -g @salesforce/cli@latest
+          sf plugins install sfdx-git-delta
+
+      - name: Authenticate to Production
+        run: |
+          sf org login jwt \
+            --client-id "${{ secrets.SF_CONSUMER_KEY_PROD }}" \
+            --jwt-key-file <(printf '%s' "${{ secrets.SF_JWT_KEY_PROD }}") \
+            --username "${{ secrets.SF_USERNAME_PROD }}" \
+            --instance-url https://login.salesforce.com \
+            --alias production
+
+      - name: Compute delta package
+        id: delta
+        run: |
+          mkdir -p delta
+          # `--from` is the last successfully-deployed commit; `--to` is HEAD.
+          # For a fresh setup, use the previous commit on main: ${{ github.event.before }}
+          sf sgd source delta \
+            --from "${{ github.event.before }}" \
+            --to "HEAD" \
+            --output-dir delta \
+            --generate-delta \
+            --source-dir force-app
+
+          # If nothing changed in deployable metadata, skip the deploy.
+          if [[ ! -s delta/package/package.xml ]] || ! grep -q "<types>" delta/package/package.xml; then
+            echo "No deployable changes detected, skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Files in delta:"
+          find delta -type f | head -50
+
+      - name: Validate-only on production (optional safety check)
+        if: steps.delta.outputs.skip != 'true'
+        run: |
+          sf project deploy validate \
+            --target-org production \
+            --manifest delta/package/package.xml \
+            --source-dir delta/force-app \
+            --test-level RunSpecifiedTests \
+            --tests $(cat delta/package/package.xml | grep -oP '(?<=<members>)[^<]+(?=</members>)' | grep -i Test | tr '\n' ' ') \
+            --wait 30
+
+      - name: Deploy delta + destructive changes
+        if: steps.delta.outputs.skip != 'true'
+        run: |
+          # Deploy additions/changes
+          sf project deploy start \
+            --target-org production \
+            --manifest delta/package/package.xml \
+            --source-dir delta/force-app \
+            --test-level RunSpecifiedTests \
+            --wait 30
+
+          # Apply destructive changes (deletions) if any
+          if [[ -s delta/destructiveChanges/destructiveChanges.xml ]]; then
+            sf project deploy start \
+              --target-org production \
+              --manifest delta/destructiveChanges/destructiveChanges.xml \
+              --pre-destructive-changes delta/destructiveChanges/destructiveChanges.xml \
+              --wait 30
+          fi
+```
+
+**Key points**:
+- `--from` should be the SHA of the last successfully-deployed commit. The simplest source of truth is `${{ github.event.before }}` on a `push` event, which is the commit `main` was at *before* this push. For more reliable tracking, write the deployed SHA to a Salesforce custom setting after each successful deploy and read it back.
+- `fetch-depth: 0` on `checkout@v4` is **mandatory** — without full history, `sgd` can't compute the diff.
+- Test selection: when you run delta deploys, you typically don't want `RunLocalTests` (slow). Use `RunSpecifiedTests` and let `sgd` or your own logic identify which test classes cover the changed Apex.
+- Destructive changes: `sgd` separates additions/modifications from deletions. Salesforce requires deletions go in `destructiveChanges.xml`, deployed via `--pre-destructive-changes` or `--post-destructive-changes`.
+- **Delta deploys are not a replacement for full deploys**, they're an optimization. Run a periodic (e.g., weekly) full deploy to catch drift between what's in git and what's in the org. Without this, a manual change in production will silently persist forever because no delta will ever notice it.
+
+**When to use**: Mid-to-large orgs with frequent small deploys; teams hitting Salesforce metadata API time limits; teams whose deploys touch unrelated metadata. **Skip if** your codebase fits in `< 100 metadata files` or you only deploy weekly — the overhead isn't worth it at small scale.
+
+### Pattern 7: Unlocked Package Development
+
+**The Problem**: A monolithic `force-app/` directory shared by 30 developers means everyone steps on each other's metadata. Refactoring is terrifying because changing a "shared" Apex class means re-testing everything. There's no clean way to roll back one team's feature without rolling back everyone else's.
+
+**The Solution**: Decompose the codebase into **unlocked packages** — versioned, independently installable bundles of metadata. Each package has its own directory, its own version history, and its own test isolation. Teams own their packages and ship on their own cadence; consumers (other packages or the base org) declare dependencies on specific package versions.
+
+**Workshop Value**: "Packages are how Salesforce themselves build their AppExchange products. They give you the same superpower internally: each team owns a package, ships on their own cadence, and can roll back without touching anyone else. It's the closest thing Salesforce has to microservices."
+
+**Why this matters more for Agentforce**: Agentforce agents, topic actions, prompt templates, and Apex grounding methods often span multiple domains (sales, service, finance). Without packaging, every agent change triggers a full-org redeploy. With packaging, an "Agentforce-Sales" package can ship independently of "Agentforce-Service" — even though they share the underlying Einstein Trust Layer config.
+
+**Project structure**:
+
+```
+sfdx-project.json
+force-app/
+├── core/                       # Shared utilities, base-org metadata
+│   ├── main/default/...
+│   └── (no namespace)
+├── billing/                    # Billing domain package
+│   └── main/default/...
+├── agentforce-sales/           # Agentforce sales agents + actions
+│   └── main/default/...
+└── agentforce-service/         # Agentforce service agents + actions
+    └── main/default/...
+```
+
+**`sfdx-project.json`** (the source of truth for package layout):
+
+```json
+{
+  "packageDirectories": [
+    {
+      "path": "force-app/core",
+      "package": "Core",
+      "default": false,
+      "versionName": "ver 1.0",
+      "versionNumber": "1.0.0.NEXT"
+    },
+    {
+      "path": "force-app/billing",
+      "package": "Billing",
+      "default": false,
+      "versionName": "ver 1.0",
+      "versionNumber": "1.0.0.NEXT",
+      "dependencies": [
+        { "package": "Core@1.0.0-1" }
+      ]
+    },
+    {
+      "path": "force-app/agentforce-sales",
+      "package": "AgentforceSales",
+      "default": false,
+      "versionName": "ver 1.0",
+      "versionNumber": "1.0.0.NEXT",
+      "dependencies": [
+        { "package": "Core@1.0.0-1" },
+        { "package": "Billing@1.0.0-1" }
+      ]
+    }
+  ],
+  "namespace": "",
+  "sfdcLoginUrl": "https://login.salesforce.com",
+  "sourceApiVersion": "64.0",
+  "packageAliases": {
+    "Core": "0Ho...",
+    "Billing": "0Ho...",
+    "AgentforceSales": "0Ho..."
+  }
+}
+```
+
+**Workflow: Build → Promote → Install**
+
+```yaml
+name: Package Version Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'force-app/agentforce-sales/**'   # Only fire when this package's metadata changed
+
+jobs:
+  build-package-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SF CLI
+        run: npm install -g @salesforce/cli@latest
+
+      - name: Authenticate to Dev Hub
+        run: |
+          sf org login jwt \
+            --client-id "${{ secrets.SF_DEVHUB_CONSUMER_KEY }}" \
+            --jwt-key-file <(printf '%s' "${{ secrets.SF_DEVHUB_JWT_KEY }}") \
+            --username "${{ secrets.SF_DEVHUB_USERNAME }}" \
+            --set-default-dev-hub \
+            --alias devhub
+
+      - name: Create new package version
+        id: pkg
+        run: |
+          # Create the version. --code-coverage runs all package tests during build.
+          # --installation-key-bypass is fine for internal-only packages; never on public ones.
+          RESULT=$(sf package version create \
+            --package AgentforceSales \
+            --installation-key-bypass \
+            --wait 30 \
+            --code-coverage \
+            --json)
+
+          VERSION_ID=$(echo "$RESULT" | jq -r '.result.SubscriberPackageVersionId')
+          echo "version_id=$VERSION_ID" >> "$GITHUB_OUTPUT"
+          echo "Built version: $VERSION_ID"
+
+      - name: Promote version (mark as released)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          # Only promoted versions can be installed in production.
+          sf package version promote --package "${{ steps.pkg.outputs.version_id }}" --no-prompt
+
+      - name: Update sfdx-project.json with new version alias
+        run: |
+          # Read package alias and update sfdx-project.json so consumers pick up the new version.
+          # This commit-back step keeps the version aliases in git as a single source of truth.
+          jq --arg vid "${{ steps.pkg.outputs.version_id }}" \
+             '.packageAliases.AgentforceSales_LATEST = $vid' \
+             sfdx-project.json > sfdx-project.json.tmp && mv sfdx-project.json.tmp sfdx-project.json
+
+      - name: Commit version bump
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(agentforce-sales): bump to ${{ steps.pkg.outputs.version_id }}"
+          file_pattern: sfdx-project.json
+
+  install-to-prod:
+    needs: build-package-version
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install SF CLI
+        run: npm install -g @salesforce/cli@latest
+
+      - name: Authenticate to Production
+        run: |
+          sf org login jwt \
+            --client-id "${{ secrets.SF_CONSUMER_KEY_PROD }}" \
+            --jwt-key-file <(printf '%s' "${{ secrets.SF_JWT_KEY_PROD }}") \
+            --username "${{ secrets.SF_USERNAME_PROD }}" \
+            --alias production
+
+      - name: Install package version
+        run: |
+          sf package install \
+            --package "${{ needs.build-package-version.outputs.version_id }}" \
+            --target-org production \
+            --wait 60 \
+            --publish-wait 60 \
+            --no-prompt
+```
+
+**Key points**:
+- **Dev Hub is required.** Package versions are created in a Dev Hub org (a Salesforce org with the Dev Hub feature enabled). Authentication to Dev Hub uses the same JWT pattern; store the credentials separately from production secrets.
+- **`--code-coverage` enforces 75% test coverage at version-build time.** A version that fails coverage cannot be created — your tests must run *and* pass *during* the build, not after.
+- **Promoted versions are immutable.** Once a version is promoted (released), you cannot delete it or modify it. Treat package versions like git tags.
+- **Dependencies are version-pinned.** `"Core@1.0.0-1"` means *that exact* Core version. If Core ships v2, your package keeps using v1 until you bump the dependency. This is the entire point — no transitive metadata surprises.
+- **First-time setup is heavy.** Decomposing an existing `force-app/` into packages is a project, not an afternoon. Plan 1–4 weeks per package depending on entanglement. Start with leaf-node packages (no dependencies) and work backward.
+- **Not all metadata is package-able.** A handful of metadata types (org-wide settings, some standard object configurations) cannot live in unlocked packages and must stay in a "base org" deployment. Salesforce's [unsupported metadata coverage](https://developer.salesforce.com/docs/metadata-coverage) is the authoritative list.
+
+**When to use**: Teams of 20+ developers; codebases with multiple distinct domains; orgs that need independent release cadences per team; any org adopting Agentforce at scale (multi-team, multi-agent). **Skip if** you have one team, one product, and ship together — the overhead exceeds the benefit.
+
 ## Additional Key Workflows
 
 ### Branch Strategy for Salesforce
 
-Recommend a branch strategy based on team size and deployment frequency:
+> **⚠️ Avoid GitFlow for Salesforce.** GitFlow's long-lived `develop` and `release/*` branches were designed for versioned binary releases shipped on a schedule. Salesforce metadata is **not** a binary — it's a declarative description of an org's current state. Long-lived branches accumulate metadata drift (someone clicked something in the org, a different sandbox refresh stomped a change, an admin made a fix in prod), and merging them produces conflicts that no human can reliably resolve. This is the #1 cause of "we can't deploy on Fridays" anxiety in Salesforce DevOps. The solution is shorter-lived branches and **packages**, not more branches.
 
-**For Small Teams (1-5 developers)**:
-- **Trunk-based development**: Direct commits to `main`, short-lived feature branches
-- Feature branches: `feature/description`
-- Validate on PR, quick deploy on merge
-- Use scratch orgs for feature development
+The right strategy depends on team size *and* whether you've adopted unlocked packages.
 
-**For Medium Teams (5-20 developers)**:
-- **GitHub Flow variant**:
-  - `main` (production)
-  - `develop` (integration)
-  - `feature/*` (features)
-  - `hotfix/*` (production fixes)
-- Validate on PR, deploy to sandbox from `develop`, promote to production from `main`
+#### **For Small Teams (1–5 developers): Trunk-Based Development**
 
-**For Large Teams (20+ developers)**:
-- **Gitflow with release branches**:
-  - `main` (production)
-  - `release/*` (release candidates)
-  - `develop` (integration)
-  - `feature/*` (features)
-  - `hotfix/*` (production fixes)
-- Use package-based development for parallel work streams
+- Single long-lived branch: `main`
+- Short-lived feature branches (hours to a few days, never weeks): `feature/description`
+- Validate on PR (Pattern 1 matrix), Quick Deploy on merge (Pattern 3)
+- Scratch orgs for feature dev, with source tracking enabled
+- One sandbox (UAT or partial copy) acts as pre-prod
+- **Why**: Optimizes for fast feedback. Most metadata conflicts get caught in 1–2 day windows.
+
+```
+main ──────●─────●─────●─────●─────●──── (production)
+            \   / \   /     /
+             \ /   \ /     /
+              ● PR  ● PR  ● PR
+              feature  feature  feature
+              (1-2 days)
+```
+
+#### **For Medium Teams (5–20 developers): Trunk-Based + Environment Branches**
+
+- `main` is the source of truth and deploys to production
+- Optional **environment branches** for non-prod orgs (`env/uat`, `env/integration`) — these are *promotion targets*, not development branches
+- Feature branches still cut from `main`, merge back to `main`
+- A merge to `main` triggers Quick Deploy to production; promoting from `main` to `env/uat` is a separate workflow (e.g. nightly cherry-pick or a manual PR)
+- **Why**: Keeps the trunk clean and gives you environment-specific gates without GitFlow's `develop` drift problem. Each environment branch is "what's currently in this org," updated by automation, not by humans typing `git merge`.
+
+```
+main ──────●─────●─────●─────●─────●──── (production, source of truth)
+            ╲                ╲
+             ╲ promote         ╲ promote
+              ▼                  ▼
+env/uat   ────●──────────────────●─────── (UAT org state)
+                                  ╲
+env/int   ────────────────────────●────── (integration org state)
+```
+
+#### **For Large Teams (20+ developers): Unlocked Packages + Trunk Per Package**
+
+- The codebase is decomposed into **unlocked packages** (modular metadata bundles with their own versions)
+- Each package has its own directory in `force-app/`, its own version in `sfdx-project.json`, and ideally its own CODEOWNERS line
+- Each team owns one or more packages and works on `main` (or their fork) independently
+- Packages are versioned and installed into target orgs via dependency declarations — no monolithic deploy
+- **No `develop` branch, no `release/*` branches.** Releases are package version bumps + install
+- **Why**: This is how Salesforce themselves recommend organizing large code bases. Packages give you true parallel work streams without merge conflicts because each package is its own metadata unit. See Pattern 6 (Unlocked Package Development) below.
+
+```
+main ──────●─────●─────●─────●─────●─────●──── (all packages, single trunk)
+            │     │     │     │     │     │
+            ▼     ▼     ▼     ▼     ▼     ▼
+       PackageA  PackageB  PackageC  PackageA
+       v1.2     v3.4      v0.9     v1.3
+       (independently versioned, independently installable)
+```
+
+#### **What about hotfixes?**
+
+For all three strategies: hotfix = short-lived branch off `main` (or off the affected package's last released version), validate, Quick Deploy, merge back. No special hotfix branch hierarchy needed.
+
+#### **Branch protection rules to enforce on `main`**
+
+Regardless of strategy:
+- Require PR + at least 1 review
+- Require status checks (validate-pr workflow must pass)
+- Require branches to be up to date before merging (catches metadata conflicts early)
+- Restrict who can push directly (no one — even admins go through PR)
+- Require signed commits if compliance demands it
 
 ### Testing Strategy
 
@@ -535,33 +1027,42 @@ Implement a comprehensive testing strategy in workflows:
 
 ```yaml
 - name: Run Apex Tests
+  id: apex-tests
   run: |
+    # Run synchronously (--synchronous) so the JSON result includes coverage inline.
+    # Capture output to a file so we can parse it without re-querying.
     sf apex run test \
       --target-org ${{ matrix.org_alias }} \
       --test-level RunLocalTests \
       --code-coverage \
-      --result-format human \
-      --wait 60
+      --detailed-coverage \
+      --result-format json \
+      --wait 60 \
+      --output-dir test-results \
+      --synchronous > test-results/run.json
+    echo "test_run_id=$(jq -r '.result.summary.testRunId' test-results/run.json)" >> "$GITHUB_OUTPUT"
 
 - name: Validate Code Coverage
   run: |
-    COVERAGE=$(sf apex get test --target-org ${{ matrix.org_alias }} --json | jq '.result.summary.testRunCoverage' | tr -d '"' | cut -d'%' -f1)
+    # `testRunCoverage` is a numeric percentage already (e.g. 87) — no '%' suffix, no quotes.
+    COVERAGE=$(jq -r '.result.summary.testRunCoverage' test-results/run.json)
     REQUIRED_COVERAGE=${{ vars.TEST_COVERAGE_REQUIRED || 75 }}
-    
-    if (( $(echo "$COVERAGE < $REQUIRED_COVERAGE" | bc -l) )); then
-      echo "❌ Code coverage $COVERAGE% is below required $REQUIRED_COVERAGE%"
+
+    # Use awk for floating-point comparison (bc may not be on every runner image).
+    if awk -v c="$COVERAGE" -v r="$REQUIRED_COVERAGE" 'BEGIN { exit !(c < r) }'; then
+      echo "❌ Code coverage ${COVERAGE}% is below required ${REQUIRED_COVERAGE}%"
       exit 1
     fi
-    echo "✅ Code coverage $COVERAGE% meets requirement"
+    echo "✅ Code coverage ${COVERAGE}% meets requirement (>= ${REQUIRED_COVERAGE}%)"
 
-- name: Static Code Analysis
+- name: Static Code Analysis (Salesforce Code Analyzer)
   run: |
-    npm install -g @salesforce/sfdx-scanner
-    sfdx scanner:run \
-      --target "force-app/**/*.cls,force-app/**/*.trigger" \
-      --engine pmd \
-      --category "Security,Best Practices,Code Style" \
-      --severity-threshold 3
+    npm install -g @salesforce/plugin-code-analyzer
+    sf code-analyzer run \
+      --workspace "force-app/**/*.cls,force-app/**/*.trigger" \
+      --rule-selector "Security:Recommended,BestPractices:Recommended,CodeStyle:Recommended" \
+      --severity-threshold 3 \
+      --output-file scan-results.sarif
 
 - name: LWC ESLint
   run: |
@@ -577,26 +1078,27 @@ Provide multiple authentication options based on user preference:
 ```yaml
 - name: Authenticate via Auth URL
   run: |
-    echo "${{ secrets.SFDX_AUTH_URL }}" > auth_url.txt
-    sf org login sfdx-url --sfdx-url-file auth_url.txt --alias target-org
+    sf org login sfdx-url \
+      --sfdx-url-file <(printf '%s' "${{ secrets.SFDX_AUTH_URL }}") \
+      --alias target-org
 ```
 
 **2. JWT (Recommended for Production)**:
 ```yaml
 - name: Authenticate via JWT
   run: |
-    echo "${{ secrets.SF_JWT_KEY }}" > jwt-key.txt
     sf org login jwt \
       --client-id ${{ secrets.SF_CONSUMER_KEY }} \
-      --jwt-key-file jwt-key.txt \
+      --jwt-key-file <(printf '%s' "${{ secrets.SF_JWT_KEY }}") \
       --username ${{ secrets.SF_USERNAME }} \
       --instance-url https://login.salesforce.com \
       --alias production
-    rm jwt-key.txt
 ```
 
-**3. OIDC (Most Secure, GitHub Enterprise)**:
-- See Pattern 2 above
+> **Security note**: Use process substitution `<(printf '%s' "$SECRET")` instead of writing the private key to a file with `echo > jwt.key && rm jwt.key`. Files written to the runner can leak through workflow logs (when `set -x` is enabled), uploaded artifacts, runner caches, or post-job hooks. Process substitution keeps the key in a transient file descriptor that the kernel reaps when the process exits. **Never use `echo "$SECRET" > file`** — `echo` may interpret backslashes; `printf '%s'` does not.
+
+**3. OIDC via Identity Broker (GitHub Enterprise)**:
+- See Pattern 2 above for the GitHub OIDC → Identity Broker → Salesforce JWT flow
 
 ### Scratch Org Workflows
 
@@ -620,8 +1122,9 @@ jobs:
       
       - name: Authenticate to Dev Hub
         run: |
-          echo "${{ secrets.SFDX_AUTH_URL_DEVHUB }}" > auth_url.txt
-          sf org login sfdx-url --sfdx-url-file auth_url.txt --alias devhub --set-default-dev-hub
+          sf org login sfdx-url \
+            --sfdx-url-file <(printf '%s' "${{ secrets.SFDX_AUTH_URL_DEVHUB }}") \
+            --alias devhub --set-default-dev-hub
       
       - name: Create Scratch Org
         run: |
@@ -755,82 +1258,170 @@ Provide the team with:
 
 ## Agentforce-Specific Considerations
 
-When working with Agentforce projects, add these additional steps:
+When working with Agentforce projects, add the validations below. **A note on what "Agentforce security scanning" can and cannot do in CI:**
 
-### 1. Agentforce Security Scanning
-Create a dedicated security scan job for Agentforce:
+> Real prompt injection defense lives in the **Einstein Trust Layer** — Salesforce's runtime protections that mask PII before sending to the LLM, detect prompt injection in user input, and apply toxicity filters. CI cannot replace those runtime controls. What CI *can* do is validate **the metadata you ship**: that agents are configured with the trust controls turned on, that prompt templates don't have unsafe variable bindings, that agent instructions don't hard-code secrets or PII, and that topic actions are scoped to the right permission sets. Anything that pretends to do "prompt injection scanning" with `grep` is security theater — the model itself is what evaluates prompts at runtime, not your CI runner.
 
-```yaml
-agentforce-security:
-  runs-on: ubuntu-latest
-  if: vars.AGENTFORCE_ENABLED == 'true'
-  steps:
-    - uses: actions/checkout@v4
-    
-    - name: Scan for Prompt Injection Risks
-      run: |
-        echo "🔍 Scanning for prompt injection vulnerabilities..."
-        
-        # Check for unsafe user input handling in prompts
-        if grep -r "String.*prompt.*=.*" force-app/ | grep -v "sanitize\|escape"; then
-          echo "⚠️  Warning: Found potential prompt injection risks"
-          echo "Ensure all user inputs are sanitized before being used in prompts"
-        fi
-    
-    - name: Validate Grounding Implementation
-      run: |
-        echo "🔍 Validating LLM grounding..."
-        
-        # Ensure grounding methods exist
-        if ! grep -r "@AuraEnabled.*grounding" force-app/; then
-          echo "⚠️  Warning: No grounding methods found"
-          echo "Agentforce agents should implement proper grounding"
-        fi
-    
-    - name: Check for PII in Agent Instructions
-      run: |
-        echo "🔍 Checking for PII exposure..."
-        
-        # Check agent definition files for hardcoded PII
-        if grep -r "ssn\|social.*security\|credit.*card\|passport" force-app/ --include="*.agent-meta.xml"; then
-          echo "❌ Error: Potential PII found in agent instructions"
-          exit 1
-        fi
-    
-    - name: Validate Agent Topics Configuration
-      run: |
-        echo "🔍 Validating agent topics..."
-        
-        # Ensure topics are properly configured
-        find force-app/ -name "*.agent-meta.xml" -exec echo "Checking: {}" \;
+So this section validates **structural correctness of agent metadata**, not the dynamic safety of prompts in flight.
+
+### 1. Agent Metadata Validator
+
+Create `scripts/validate-agentforce.sh` in your repo. This script uses XML parsing (`xmllint` / `yq`), not regex, and exits non-zero on any structural violation. The CI step in Pattern 5 calls this directly.
+
+```bash
+#!/usr/bin/env bash
+# scripts/validate-agentforce.sh
+# Structural validation of Agentforce metadata. Catches misconfigurations that would
+# ship a less-safe agent to production. NOT a substitute for the Einstein Trust Layer.
+set -euo pipefail
+
+FAIL=0
+note() { printf '  • %s\n' "$1"; }
+err()  { printf '❌ %s\n' "$1"; FAIL=1; }
+ok()   { printf '✅ %s\n' "$1"; }
+
+# Locate Agentforce metadata. Both layouts (legacy .bot and modern Bot/AiAuthoringBundle)
+# live under force-app — adjust the find roots to your project layout.
+AGENT_FILES=$(find force-app -type f \( \
+    -name "*.bot-meta.xml" -o \
+    -name "*.aiAuthoringBundle-meta.xml" -o \
+    -name "*.genAiPlugin-meta.xml" -o \
+    -name "*.genAiPlanner-meta.xml" \
+  \) 2>/dev/null || true)
+
+if [[ -z "$AGENT_FILES" ]]; then
+  echo "No Agentforce metadata found, skipping."
+  exit 0
+fi
+
+echo "🤖 Validating Agentforce metadata..."
+
+# 1) Each Bot must have at least one BotVersion configured.
+#    A Bot with no BotVersion will deploy but is non-functional and likely misconfigured.
+for f in $(echo "$AGENT_FILES" | grep '\.bot-meta\.xml$' || true); do
+  note "Checking Bot: $f"
+  if ! xmllint --xpath '//*[local-name()="botVersions"]' "$f" >/dev/null 2>&1; then
+    err "$f has no <botVersions> — Bot will deploy but cannot be activated"
+  fi
+done
+
+# 2) Plugin/topic action permission scoping.
+#    A genAiPlugin with action references but no <permissionSetName> binding is a footgun:
+#    actions will run as whatever user invokes the agent, with full inherited permissions.
+for f in $(echo "$AGENT_FILES" | grep '\.genAiPlugin-meta\.xml$' || true); do
+  note "Checking Plugin: $f"
+  ACTION_COUNT=$(xmllint --xpath 'count(//*[local-name()="genAiPluginAction"])' "$f" 2>/dev/null || echo 0)
+  PERMSET_COUNT=$(xmllint --xpath 'count(//*[local-name()="permissionSetName"])' "$f" 2>/dev/null || echo 0)
+  if [[ "$ACTION_COUNT" -gt 0 && "$PERMSET_COUNT" -eq 0 ]]; then
+    err "$f declares $ACTION_COUNT actions but no <permissionSetName>. Bind a least-privilege permission set."
+  fi
+done
+
+# 3) Hard-coded secrets in agent instructions.
+#    XML-aware: extract <description> and <systemMessages> text only, then check.
+#    Avoids false positives from unrelated metadata files that happen to contain the word "key".
+for f in $(echo "$AGENT_FILES" | grep -E '\.(bot|aiAuthoringBundle|genAiPlanner|genAiPlugin)-meta\.xml$' || true); do
+  TEXT=$(xmllint --xpath '//*[local-name()="description" or local-name()="developerName" or local-name()="masterLabel" or local-name()="instructions" or local-name()="goal"]/text()' "$f" 2>/dev/null || true)
+  if echo "$TEXT" | grep -Eqi '(api[_-]?key|secret|password|bearer|sk_live_|sk_test_|0Ho[a-zA-Z0-9]{15})'; then
+    err "$f appears to contain a hard-coded secret in agent instructions/description"
+  fi
+done
+
+# 4) Prompt template variable hygiene.
+#    Flex-template variables look like {!$Input.X} or {!$Resource.X}. A template
+#    that passes raw user input directly into an instruction without using the
+#    {!$Input.<name>} binding is at higher injection risk. We can't catch all such cases,
+#    but we can flag templates where ALL variables are {!$Input.*} with no {!$Resource.*}
+#    or {!$EinsteinPrompt.*} grounding — i.e. raw user-driven prompts with no grounding.
+for f in $(find force-app -name "*.genAiPromptTemplate-meta.xml" 2>/dev/null); do
+  note "Checking PromptTemplate: $f"
+  INPUT_VARS=$(grep -Eo '\{!\$Input\.[A-Za-z0-9_]+\}' "$f" | sort -u | wc -l | tr -d ' ')
+  GROUND_VARS=$(grep -Eo '\{!\$(Resource|EinsteinPrompt|Apex|Flow)\.[A-Za-z0-9_]+\}' "$f" | sort -u | wc -l | tr -d ' ')
+  if [[ "$INPUT_VARS" -gt 0 && "$GROUND_VARS" -eq 0 ]]; then
+    err "$f uses {!\$Input.*} variables but no grounding ({!\$Resource.*}, {!\$Apex.*}, {!\$Flow.*}, or {!\$EinsteinPrompt.*}). High injection risk."
+  fi
+done
+
+# 5) Trust Layer configuration check.
+#    If the project includes EinsteinSetting metadata, ensure key protections aren't disabled.
+TRUST_FILE=$(find force-app -name "Einstein.einsteinSettings-meta.xml" 2>/dev/null | head -1)
+if [[ -n "$TRUST_FILE" ]]; then
+  note "Checking Einstein Trust Layer settings: $TRUST_FILE"
+  for setting in "enableMasking" "enableToxicityScoring" "enablePromptInjectionDefense"; do
+    VALUE=$(xmllint --xpath "string(//*[local-name()=\"$setting\"])" "$TRUST_FILE" 2>/dev/null || echo "")
+    if [[ "$VALUE" == "false" ]]; then
+      err "Einstein Trust Layer: $setting is explicitly disabled in $TRUST_FILE"
+    fi
+  done
+fi
+
+if [[ "$FAIL" -eq 0 ]]; then
+  ok "Agentforce metadata validation passed"
+  exit 0
+else
+  echo ""
+  echo "❌ Agentforce validation failed. Fix the issues above and re-run."
+  exit 1
+fi
 ```
 
+**What this catches** (and what it doesn't):
+
+| Issue | This script | Einstein Trust Layer (runtime) |
+|---|---|---|
+| Bot with no version (won't activate) | ✅ | ❌ |
+| Plugin actions with no permission set | ✅ | ❌ |
+| Hard-coded API keys in agent description | ✅ | ❌ |
+| Trust Layer protections explicitly disabled | ✅ | (it's the layer being disabled) |
+| Prompt template with no grounding | ✅ (heuristic) | ❌ |
+| User sends prompt-injection payload at runtime | ❌ | ✅ |
+| User sends PII; LLM should not see it | ❌ | ✅ (masking) |
+| Toxic / unsafe model output | ❌ | ✅ (toxicity scoring) |
+
+Make sure the Trust Layer settings are correct in the org. CI cannot enforce runtime safety; only deployment-time correctness.
+
 ### 2. Agent Testing Workflows
+
+For *behavioral* testing of agents (does the agent respond correctly to prompts?), use the dedicated `testing-agentforce` skill, which wraps `sf agent test create/run` and AI Evaluation Definitions. CI integration for that lives in the `testing-agentforce` skill, not here. This skill handles the *deployment* side; that one handles the *behavioral test* side.
+
+A minimal example invoking the SF CLI test command from a workflow:
+
 ```yaml
 test-agents:
   runs-on: ubuntu-latest
   steps:
     - uses: actions/checkout@v4
-    
+
     - name: Install SF CLI
-      run: npm install -g @salesforce/cli
-    
-    - name: Authenticate to Org
+      run: npm install -g @salesforce/cli@latest
+
+    - name: Authenticate to Test Org
       run: |
-        echo "${{ secrets.SFDX_AUTH_URL }}" > auth_url.txt
-        sf org login sfdx-url --sfdx-url-file auth_url.txt --alias target-org
-    
+        sf org login jwt \
+          --client-id "${{ secrets.SF_CONSUMER_KEY_TEST }}" \
+          --jwt-key-file <(printf '%s' "${{ secrets.SF_JWT_KEY_TEST }}") \
+          --username "${{ secrets.SF_USERNAME_TEST }}" \
+          --instance-url https://test.salesforce.com \
+          --alias agent-test
+
     - name: Deploy Agent Metadata
       run: |
         sf project deploy start \
-          --target-org target-org \
-          --metadata-dir force-app/main/default/agents
-    
-    - name: Test Agent Responses
+          --target-org agent-test \
+          --source-dir force-app/main/default/bots \
+          --source-dir force-app/main/default/aiAuthoringBundles \
+          --source-dir force-app/main/default/genAiPlugins \
+          --wait 30
+
+    - name: Run Agent Behavioral Tests
       run: |
-        # Use SF CLI or Apex to trigger agent conversations
-        # Validate responses against expected outcomes
-        echo "Testing agent conversation flows..."
+        # Run all AI Evaluation Definitions in the org. Test specs are authored
+        # using the `testing-agentforce` skill and live as YAML in tests/agents/.
+        sf agent test run \
+          --target-org agent-test \
+          --result-format json \
+          --output-dir test-results/agents \
+          --wait 30
 ```
 
 ## Troubleshooting Common Issues
