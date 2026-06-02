@@ -988,6 +988,8 @@ This pattern is **native-Salesforce-first by default**. Third-party tools (Prodl
 
 **Workshop Value**
 
+This is the auditor-friendly answer: Data Mask is **FedRAMP, HIPAA, and SOX certified out of the box**, with **3.5M records/hr** masking throughput — performance-competitive with (and in most published benchmarks faster than) the third-party tools it replaces. Pricing is bounded: 10% Net AOV for Data Mask + **$0 Seed add-on** when sold together.
+
 Customer evidence from Salesforce's FY27 deal wins and customer stories:
 
 - **AGCO** — 2–4 week sandbox refresh cycles → **<24 hours** (90% reduction)
