@@ -18,7 +18,7 @@ This Claude Code skill guides Salesforce teams through modernizing their applica
 * [Table of Contents](#table-of-contents)
   * [What Problem Does This Solve?](#what-problem-does-this-solve)
   * [Solution Overview](#solution-overview)
-  * [The Seven GitHub Actions Patterns](#the-seven-github-actions-patterns)
+  * [The Eight GitHub Actions Patterns](#the-eight-github-actions-patterns)
   * [Key Features](#key-features)
   * [Quick Start](#quick-start)
     * [Installation](#installation)
@@ -29,7 +29,7 @@ This Claude Code skill guides Salesforce teams through modernizing their applica
     * [3. Implement Governance and Agentforce Security](#3-implement-governance-and-agentforce-security)
     * [4. Speed Up Production Deployments](#4-speed-up-production-deployments)
     * [5. Conduct ALM Workshop](#5-conduct-alm-workshop)
-  * [The Seven Patterns Explained](#the-seven-patterns-explained)
+  * [The Eight Patterns Explained](#the-eight-patterns-explained)
     * [Pattern 1: Matrix Strategy](#pattern-1-matrix-strategy)
     * [Pattern 2: Secure JWT + Custom Properties (with optional Identity Broker)](#pattern-2-secure-jwt--custom-properties-with-optional-identity-broker)
     * [Pattern 3: Quick Deploy Pattern](#pattern-3-quick-deploy-pattern)
@@ -37,6 +37,7 @@ This Claude Code skill guides Salesforce teams through modernizing their applica
     * [Pattern 5: Custom Properties for Governance](#pattern-5-custom-properties-for-governance)
     * [Pattern 6: Delta Deployments with sfdx-git-delta](#pattern-6-delta-deployments-with-sfdx-git-delta)
     * [Pattern 7: Unlocked Package Development](#pattern-7-unlocked-package-development)
+    * [Pattern 8: Sandbox Lifecycle with Data Mask & Seed](#pattern-8-sandbox-lifecycle-with-data-mask--seed)
   * [Agentforce-Specific Capabilities](#agentforce-specific-capabilities)
   * [Why GitHub Actions for Salesforce ALM?](#why-github-actions-for-salesforce-alm)
   * [Operating Modes](#operating-modes)
@@ -72,7 +73,7 @@ This skill provides **GitHub-native, API-first orchestration patterns** that ena
 
 The `salesforce-alm-github` skill provides comprehensive ALM modernization capabilities:
 
-- **🚀 Seven GitHub Actions Patterns**: Matrix Strategy, JWT+Custom Properties (with optional Identity Broker), Quick Deploy, Repository Dispatch, Custom Properties Governance, Delta Deployments, Unlocked Packages
+- **🚀 Eight GitHub Actions Patterns**: Matrix Strategy, JWT+Custom Properties (with optional Identity Broker), Quick Deploy, Repository Dispatch, Custom Properties Governance, Delta Deployments, Unlocked Packages, Sandbox Lifecycle with Data Mask & Seed
 - **🎯 Dual Operating Modes**: Advisory (workshop facilitation) + Implementation (actual workflow generation)
 - **🤖 Agentforce-Ready**: Prompt injection scanning, PII detection, grounding validation
 - **🏢 Enterprise Governance**: Custom Properties for SOX/HIPAA compliance, fine-grained access control
@@ -83,9 +84,9 @@ The `salesforce-alm-github` skill provides comprehensive ALM modernization capab
 
 ---
 
-## The Seven GitHub Actions Patterns
+## The Eight GitHub Actions Patterns
 
-These seven patterns are unique capabilities that GitHub Enterprise provides over traditional declarative tools:
+These eight patterns are unique capabilities that GitHub Enterprise provides over traditional declarative tools — including (as of v2.1.0) the native Salesforce Data Mask & Seed sandbox lifecycle, which replaces most third-party data-deployment tooling:
 
 1. **Matrix Strategy**: Test across multiple Salesforce orgs simultaneously (3x faster than sequential)
 2. **Secure JWT + Custom Properties (with optional Identity Broker)**: JWT bearer flow gated by Custom Properties for governance, with an optional HashiCorp Vault / AWS STS / Azure Entra ID broker tier for true secretless auth. *(GitHub OIDC tokens are not natively trusted by Salesforce — a broker is required for OIDC-based auth.)*
@@ -94,6 +95,7 @@ These seven patterns are unique capabilities that GitHub Enterprise provides ove
 5. **Custom Properties for Governance**: Centralized repository classification with conditional quality gates (read at runtime via `gh api`, not via `${{ vars.X }}`)
 6. **Delta Deployments**: Use `sfdx-git-delta` to deploy only changed metadata, collapsing 30-minute full deploys to under a minute
 7. **Unlocked Package Development**: Decompose a monolithic `force-app/` into versioned, independently installable packages — the Salesforce-recommended pattern for 20+ developer teams
+8. **Sandbox Lifecycle with Data Mask & Seed**: Native Salesforce refresh → mask → seed chain using Data Mask & Seed on Core (GA July 2026). Customers report 2–4 weeks → <24 hours (AGCO), 2 weeks → 4 days replacing Prodly (Barracuda). Default to native; third-party (Prodly, Flosum, Own Accelerate) is a defensible non-default with explicit deviation criteria.
 
 ---
 
@@ -359,6 +361,32 @@ Claude will generate a workflow with parallel testing configuration and time sav
 
 ---
 
+### Pattern 8: Sandbox Lifecycle with Data Mask & Seed
+
+**Problem**: Sandboxes start either empty (Developer/Pro), with a random subset (Partial Copy capped at 10K records/object — breaks referential integrity), or with all of production including PII (Full Copy — illegal for contractors and offshore developers under GDPR/CCPA/HIPAA/PCI-DSS). Manual seeding via Data Loader takes 1–4 weeks per refresh; manual masking is error-prone and slow.
+
+**Solution**: Chain the native sandbox lifecycle — **refresh → mask → seed** — using **Salesforce Data Mask & Seed on Core** (BETA April 2026, GA July 2026). Schedule it to run automatically post-refresh; the Mask + Seed run is configured in the Data Mask & Seed UI and triggered by template association with the sandbox. GitHub Actions cron triggers `sf org refresh`; the post-copy hook handles the rest.
+
+**Value**:
+- **AGCO**: 2–4 weeks → <24 hours
+- **MSU**: 1 day → <1 hour
+- **Barracuda**: 2 weeks → 4 days, replaced Prodly
+- **Make-A-Wish**: 40 hrs saved per refresh, 90% faster
+- FedRAMP / HIPAA / SOX certified out of the box
+- 3.5M records/hr masking throughput
+- $0 Seed add-on when sold with Data Mask
+- Bypasses managed-package automations during seed
+
+**Caveat**: Data Cloud / Data 360 seeding (DLO → DLO) is "Coming Soon" per the FY27 roadmap, **not GA today** — for DC-heavy customers, this is the strongest current case to keep a third-party tool. Existing Own Accelerate customers should plan migration before the Dec 2027 EOL; legacy Data Mask Managed Package customers must migrate before the Nov 2026 end-of-service.
+
+**Default vs Deviation**: Lead with Salesforce-native (Data Mask & Seed + DevOps Center + Sandboxes). Third-party (Prodly, Flosum Data Migrator, Own Accelerate, AutoRABIT) is a defensible non-default with explicit deviation criteria documented in the pattern.
+
+**No LLMs in the Data Path**: This pattern is deterministic by design. Auditors will not accept "the AI picked these records." LLMs at *build time* (template authoring, test-case generation) is fine; at *runtime* (data movement) is not.
+
+**Use When**: Any Salesforce shop running ≥1 sandbox refresh per quarter — especially regulated industries (HIPAA/SOX/FedRAMP), admin-heavy teams who need a native UI, customers using third-party contractors, customers running CPQ/FSL/nCino (bundled starter templates apply), and customers planning Agentforce rollout (need realistic, compliant data to test agent behavior).
+
+---
+
 ## Agentforce-Specific Capabilities
 
 > **Reality check**: Real prompt-injection defense, PII masking, and toxicity filtering live in the runtime **Einstein Trust Layer**, not in CI. CI cannot evaluate prompts — only the model can. What CI *can* do is validate the metadata you ship before it ever reaches an org. This skill validates structural correctness; the Trust Layer validates runtime safety.
@@ -424,7 +452,7 @@ Explain patterns, demonstrate value, provide migration guidance.
 **Example**:
 ```
 "I'm running an ALM workshop next week. What are the key talking points for the
-seven GitHub Actions patterns?"
+eight GitHub Actions patterns?"
 ```
 
 **Output**: Workshop materials, facilitation guide, ROI analysis, team concerns Q&A

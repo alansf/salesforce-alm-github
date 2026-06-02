@@ -2,6 +2,35 @@
 
 All notable changes to the `salesforce-alm-github` skill are documented here. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] — 2026-06-01
+
+### Added
+
+- **Pattern 8: Sandbox Lifecycle with Data Mask & Seed** — native Salesforce refresh → mask → seed chain using Data Mask & Seed on Core (BETA April 2026, GA July 2026). Anchored to verified Salesforce documentation:
+  - *The 5 Stages of Agent Application Lifecycle Management* (Salesforce, official 5-stage ALM framework)
+  - *FY27 Salesforce Data Mask & Seed — First Call Deck (FCD)*
+  - *Sandboxes FY27 Use Cases Deck*
+  - *Ultimate Guide to Data Masking & Seeding* (sandbox tier table, 5 seeding challenges, 4 approaches, NIST 30x cost-of-bugs citation)
+  - *FY26 Data Mask & Seed Use Cases Deck* (sensitive data inventory, use case taxonomy)
+- **Appendix: Matrix Validation with Managed Packages** — design constraints, `RunLocalTests` behavior with namespaced tests, per-sandbox licensing implications (Certinia, Conga, SBQQ, Vlocity), test-data setup factories, and contractual due-diligence checklist for ISV-heavy customers.
+- Three eval cases (11, 12, 13) covering Pattern 8: GitHub Actions integration, third-party migration, HIPAA de-identification.
+
+### Changed
+
+- Pattern 1 (Matrix Strategy) now cross-references the new managed-package appendix at the end of the skill.
+- README updated to reflect **eight** patterns (was seven).
+- `evals.json` version bumped from `2.0.0` to `2.1.0`; eval count from 10 to 13.
+
+### Notes
+
+- v2.1.0 explicitly recommends **native Salesforce tooling** (Data Mask & Seed + DevOps Center + Sandboxes) over third-party for the common-case sandbox lifecycle. Third-party recommendations (Prodly, Flosum Data Migrator, Own Accelerate, AutoRABIT) remain documented as defensible non-defaults with explicit deviation criteria — this is a deliberate reversal of the pre-2026 bias that "native is incomplete."
+- **No Agentforce Vibes recommendations in this version.** The pattern is human-authored with deterministic runtime — LLMs are not in the data path. See the related memory entry on LLM runtime placement.
+- Lifecycle dates customers must plan around:
+  - **Data Mask Managed Package end-of-service: November 2026**
+  - **Own Accelerate end-of-life: December 2027**
+  - **Salesforce Data Mask & Seed on Core GA: July 2026** (BETA April 2026)
+  - **Data Cloud / Data 360 seeding (DLO → DLO): Coming Soon — not GA today**
+
 ## [2.0.0] — 2026-05-09
 
 Reviewed by Claude Opus 4.7. The original v1.0.0 was authored with Sonnet 4.5 and contained several technically inaccurate patterns that needed correction before broader rollout. This release fixes those issues, adds two new patterns, and rewrites the Agentforce guidance to be honest about CI's limits.

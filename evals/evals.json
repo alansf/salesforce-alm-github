@@ -1,6 +1,6 @@
 {
   "skill_name": "salesforce-alm-github",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "evals": [
     {
       "id": 1,
@@ -142,6 +142,52 @@
         {"name": "States that sfdx-scanner is deprecated", "description": "Should explicitly note that the @salesforce/sfdx-scanner plugin and 'sfdx scanner:run' command are deprecated"},
         {"name": "Recommends @salesforce/plugin-code-analyzer", "description": "Replacement should be 'npm install -g @salesforce/plugin-code-analyzer' and 'sf code-analyzer run'"},
         {"name": "Uses --rule-selector and --severity-threshold", "description": "Example invocation should use the modern flags: --workspace, --rule-selector, --severity-threshold, --output-file"}
+      ]
+    },
+    {
+      "id": 11,
+      "prompt": "We just heard about Salesforce Data Mask & Seed. Can you walk through how we'd integrate it into our GitHub Actions release pipeline? Today our sandbox refresh is manual and takes our team about 2 weeks of CSV wrangling each time.",
+      "expected_output": "Pattern 8 walkthrough — refresh → mask → seed chain using native Salesforce Data Mask & Seed on Core, scheduled via GitHub Actions cron, with the post-copy hook firing Mask + Seed automatically based on template association. Should cite specific customer evidence (AGCO 24hr, Make-A-Wish 90% faster), the four-phase model, and the native-first deviation criteria.",
+      "files": [],
+      "assertions": [
+        {"name": "Recommends native Salesforce Data Mask & Seed first", "description": "Must lead with Salesforce-native Data Mask & Seed (GA July 2026), not Prodly/Flosum/Own/AutoRABIT. Should explicitly note the pre-2026 'native is incomplete' bias is no longer correct."},
+        {"name": "Describes the four-phase refresh→mask→seed→available model", "description": "Should walk through Refresh, Mask, Seed, Available phases with what each phase does"},
+        {"name": "Uses GitHub Actions cron + sf org refresh", "description": "Workflow should trigger sandbox refresh on schedule and rely on UI-configured post-copy hook for Mask+Seed, not custom orchestration scripts"},
+        {"name": "Uses process substitution for auth", "description": "Auth steps must use <(printf '%s' \"$SECRET\") consistent with Pattern 2 — not echo > file"},
+        {"name": "Cites customer evidence with specifics", "description": "Should reference at least two of: AGCO (2-4 weeks → <24 hrs), MSU (1 day → <1 hr), Barracuda (replaced Prodly), Make-A-Wish (40 hrs saved), Town of Cary, Molson Coors"},
+        {"name": "References Pattern 8 from skill", "description": "Should demonstrate the Sandbox Lifecycle pattern from the skill"},
+        {"name": "Does not put LLMs in the runtime data path", "description": "Must NOT recommend Agentforce Vibes or AI-driven seeding/deployment in the runtime path. LLMs may be referenced for build-time authoring only."}
+      ]
+    },
+    {
+      "id": 12,
+      "prompt": "Our sandbox refresh takes 2 weeks. We're currently using Own Accelerate (with the Anonymize + Seed bundle). We just heard Salesforce is acquiring Own. Should we migrate to something else, stay on Accelerate, or wait?",
+      "expected_output": "Context-aware recommendation: migrate to Salesforce Data Mask + $0 Seed at next renewal (not extend Accelerate, which has Dec 2027 EOL). Should cite Barracuda (replaced Prodly, 2 wks → 4 days) as evidence the native tool is now competitive, AGCO 24hr, and the deviation criteria for when staying with a third-party is defensible.",
+      "files": [],
+      "assertions": [
+        {"name": "States Own Accelerate end-of-life is December 2027", "description": "Must explicitly call out the Dec 2027 EOL date for Accelerate so the customer can plan renewal timing"},
+        {"name": "Recommends migration to Data Mask + $0 Seed at renewal", "description": "Recommendation should be migration at next renewal, not extension of Accelerate"},
+        {"name": "Notes Data Mask Managed Package end-of-service is November 2026", "description": "Customers on the legacy managed package must migrate before Nov 2026 — separate from Accelerate EOL"},
+        {"name": "Cites customer evidence on switching", "description": "Should reference Barracuda (replaced Prodly, 2 wks → 4 days), AGCO (2-4 wks → <24 hrs), and at least one more"},
+        {"name": "Lists defensible deviation criteria", "description": "Should enumerate when keeping a third-party tool is defensible: heavy SBQQ/OmniStudio data deployment with existing Prodly investment, Data Cloud / Data 360 seeding (Coming Soon, not GA), existing Flosum Data Migrator on current contract"},
+        {"name": "Does not stay on Accelerate as recommended path", "description": "Must NOT recommend extending or renewing Accelerate as the primary path"},
+        {"name": "References Pattern 8 from skill", "description": "Should demonstrate the Sandbox Lifecycle pattern from the skill"}
+      ]
+    },
+    {
+      "id": 13,
+      "prompt": "We have HIPAA-bound patient data in our sandboxes. Auditors want documented evidence of how we de-identify it before contractors and offshore developers get access. What's the right architecture?",
+      "expected_output": "Native Data Mask leadership with FedRAMP/HIPAA/SOX certification call-out, enumeration of the 9 masking strategies, schedule-after-refresh orchestration, and explicit framing that the deterministic runtime is what makes this auditor-defensible (no LLMs in the data path).",
+      "files": [],
+      "assertions": [
+        {"name": "Leads with native Salesforce Data Mask", "description": "Recommendation should lead with on-platform Data Mask (within Salesforce Trust Boundary) rather than third-party masking tools"},
+        {"name": "Cites FedRAMP/HIPAA/SOX certification", "description": "Must explicitly note Data Mask is FedRAMP, HIPAA, and SOX certified out of the box — this is the auditor evidence"},
+        {"name": "Enumerates the 9 masking strategies", "description": "Should list the masking strategies: Replace with Library, Pattern Masking, Anonymize, Custom Value, Fill if Empty, Existing Value Random, Partial List, Deletion, Partial Value"},
+        {"name": "Describes schedule-after-refresh orchestration", "description": "Should explain that Mask runs automatically after sandbox refresh based on template association, before any user (including contractors) can log in"},
+        {"name": "Notes 3.5M records/hr throughput", "description": "Should cite the masking throughput figure as evidence native is performance-competitive"},
+        {"name": "Frames sensitive data inventory", "description": "Should enumerate categories of PII to scope the mask template (SSN, medical records, insurance, salary, etc.)"},
+        {"name": "Explicitly excludes LLMs from the data path", "description": "Must state that the masking pipeline is deterministic and auditors will not accept 'the AI picked which fields to mask'. LLMs at build time (template authoring) is fine; at runtime is not."},
+        {"name": "References Pattern 8 from skill", "description": "Should demonstrate the Sandbox Lifecycle pattern from the skill"}
       ]
     }
   ]
