@@ -84,6 +84,8 @@ jobs:
 
 **When to use**: Users need to test across multiple orgs, multiple Salesforce editions, or multiple API versions simultaneously.
 
+> **For ISV/managed-package customers** (Certinia, Conga, SBQQ CPQ, Vlocity/OmniStudio): see *Appendix: Matrix Validation with Managed Packages* at the end of this skill for the 3-leg matrix shape (vanilla / integration-with-package / full-with-package), `RunLocalTests` behavior with namespaced tests, per-sandbox licensing implications, and the contractual due-diligence checklist before recommending matrix at scale.
+
 ### Pattern 2: Secure JWT + Custom Properties (with optional Identity Broker)
 
 **The Problem**: Managing long-lived secrets (SFDX Auth URLs, certificates) is risky and doesn't provide fine-grained governance based on repository metadata. Most teams want "OIDC with Salesforce" but Salesforce **does not natively trust GitHub's OIDC issuer** — there is no out-of-the-box federation between `token.actions.githubusercontent.com` and a Salesforce Connected App.
@@ -946,6 +948,144 @@ jobs:
 
 **When to use**: Teams of 20+ developers; codebases with multiple distinct domains; orgs that need independent release cadences per team; any org adopting Agentforce at scale (multi-team, multi-agent). **Skip if** you have one team, one product, and ship together — the overhead exceeds the benefit.
 
+### Pattern 8: Sandbox Lifecycle with Data Mask & Seed
+
+**The Problem**
+
+Sandboxes start in one of three useless states:
+
+| Sandbox Type | Fee to Salesforce | Storage Size | Refresh Interval | Type of Data |
+|---|---|---|---|---|
+| Developer | Free | 200 MB | 1 day permissible | Metadata only |
+| Developer Pro | 5% of net spend | 1 GB | 1 day permissible | Metadata only |
+| Partial Copy | 20% of net spend | 5 GB | 5 days permissible | Metadata + fraction of production data |
+| Full Copy | 30% of net spend | Same as production org | 28 days permissible | Metadata + all production data |
+
+Developer/Pro come up empty. Partial Copy comes up with a random sampled subset (capped at 10K records/object) — random samples break referential integrity, because sandbox refresh only follows master-detail or required-lookup relationships, so the parent of a child you sampled may not be present. Full Copy comes up with all of production, including PII you cannot legally let contractors or developers see under GDPR / CCPA / HIPAA / PCI-DSS.
+
+The five canonical seeding challenges (per Salesforce's *Ultimate Guide to Data Masking & Seeding*):
+
+1. **Maintaining parent-child relationships** — refreshes only follow master-detail / required lookup; everything else fragments
+2. **Filtering and refining test data and attachments** — Data Loader requires CSV manipulation; polymorphic fields, intra-object relationships, and attachment storage limits compound
+3. **Seeding on-demand** — development cycles outpace refresh capability; teams hand-tune CSVs only to redo it when requirements shift
+4. **Protecting confidential data** — sandboxes contain PII; GDPR/CCPA/HIPAA/PCI-DSS impose strict controls; third-party contractors amplify risk
+5. **Keeping data consistent across orgs** — without comparison tooling, the only diff option is V-Lookup across CSVs in Excel
+
+The four traditional approaches and their limits:
+
+1. **Sandbox Refresh** — refresh from prod; Developer/Pro only get metadata; refresh frequency is rate-limited (5 days / 28 days)
+2. **Sandbox Cloning** — clone an existing well-curated sandbox; preserves data + metadata but freezes the curation effort in time
+3. **Data Loader** — bulk CSV import/export; "be prepared to set aside a couple of extra weeks to fully replicate the necessary objects and their dependencies"
+4. **Salesforce Data Mask & Seed (Recommended)** — the native answer covered in this pattern
+
+NIST: companies spend an average of **30x more** to fix bugs released into production. Manual seeding that takes 1–4 weeks per refresh is the upstream cause.
+
+**The Solution**
+
+Chain the native sandbox lifecycle — **refresh → mask → seed** — using Salesforce Data Mask & Seed on Core. Schedule it to run automatically. No third-party tool required for the common case.
+
+This pattern is **native-Salesforce-first by default**. Third-party tools (Prodly, Flosum Data Migrator, Own Accelerate, AutoRABIT) are documented as defensible non-defaults at the end of this pattern, with explicit deviation criteria. The bias before 2026 was "native is incomplete, reach for third-party"; with Data Mask & Seed on Core (BETA April 2026, GA July 2026), that bias is no longer correct.
+
+**Workshop Value**
+
+Customer evidence from Salesforce's FY27 deal wins and customer stories:
+
+- **AGCO** — 2–4 week sandbox refresh cycles → **<24 hours** (90% reduction)
+- **Make-A-Wish** — 40 hrs saved per refresh, 90% faster sandbox seeding
+- **MSU** — 1 day → **<1 hour**
+- **Barracuda** — 2 weeks → **4 days**, explicitly replaced Prodly
+- **Town of Cary** — 1,800 SF users, no dedicated SF admin needed for setup
+- **Molson Coors** — "replicate data within minutes by creating Seed Templates… saves us the time of creating hierarchical relationships from scratch"
+
+The native tooling is now faster than the third-party alternatives that preceded it. That's the workshop headline.
+
+**The Four-Phase Model**
+
+```
+┌───────────┐    ┌────────┐    ┌────────┐    ┌──────────────┐
+│  Refresh  │ →  │  Mask  │ →  │  Seed  │ →  │  Available   │
+└───────────┘    └────────┘    └────────┘    └──────────────┘
+   sf org         9 masking     synthetic +     compliant +
+   refresh        strategies    template-       test-ready
+                  bulk on PII   driven seed     sandbox
+```
+
+1. **Refresh** — Salesforce performs sandbox refresh (Partial or Full Copy)
+2. **Mask** — Data Mask runs (per template); de-identifies PII at the database layer using one of nine masking strategies:
+   - Replace with Library, Pattern Masking, Anonymize, Custom Value, Fill if Empty, Existing Value Random, Partial List, Deletion, Partial Value
+3. **Seed** — Data Seed populates curated test records; supports synthetic data, master-detail awareness, starter templates (CPQ, FSL, nCino), and **bypass of automations including managed-package automations** during seeding
+4. **Available** — sandbox is now compliant + test-ready; users can begin work
+
+**Sensitive Data Inventory** (use to scope the mask template per sObject):
+
+- *Personal*: SSN/National IDs, Passport, Driver's License, Tax ID, Bank Account, Credit/Debit Card, Transaction History, Medical Records, Insurance, Salary/Compensation, Performance Reviews, Emergency Contacts
+- *Business*: Revenue, Financial Reports, Cost Structures, Budget, Intellectual Property, Business Processes, Audit Logs
+
+**Implementation Steps**
+
+1. **Classify sObjects** — tag each object as PII / Confidential / Internal. The mask template applies a default masking strategy per classification, with field-level overrides
+2. **Configure Data Mask templates** — one per sandbox tier or compliance regime (e.g., one for HIPAA-bound sandboxes, one for general dev). Use bundled starter templates for CPQ, FSL, nCino as a starting point
+3. **Define seeding policies** — pick the records that represent your test scenarios. Filter by date, region, account size; honor hierarchical relationships; enable bypass-automations to avoid Apex side effects during the bulk insert
+4. **Wire the chain via Data Mask & Seed UI scheduling** — "Run after refresh or on a schedule." This is the lowest-friction path and works for admin-led teams without git skills
+5. **For CI/CD orchestration** — GitHub Actions cron triggers `sf org refresh`; the post-copy hook fires Mask + Seed automatically based on template association with the sandbox. Example workflow stub:
+
+```yaml
+name: Sandbox Refresh + Mask + Seed
+on:
+  schedule:
+    - cron: '0 2 * * 0'  # Sunday 2am UTC
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Authenticate to Production (source)
+        run: sf org login jwt --client-id $SF_CLIENT_ID --jwt-key-file <(printf '%s' "$SF_JWT_KEY") --username $SF_PROD_USERNAME --alias prod
+      - name: Trigger sandbox refresh
+        run: sf org create sandbox --name UAT --license-type Partial --target-org prod --wait 60
+      # Mask + Seed run automatically post-copy via the template association
+      # configured in the Data Mask & Seed UI; no further GitHub Actions step needed.
+      - name: Verify post-refresh sandbox state
+        run: sf org login jwt --client-id $SF_CLIENT_ID --jwt-key-file <(printf '%s' "$SF_JWT_KEY") --username $SF_UAT_USERNAME --alias uat && sf data query --query "SELECT COUNT(Id) FROM Account" --target-org uat
+```
+
+**Common Gotchas**
+
+- **Tenant model**: Data Mask runs on force.com (the Salesforce platform); Seed currently runs on Own infrastructure (managed by customer post-acquisition). Customers need to manage both. **A single Seed tenant can serve multiple orgs — don't create multiple Seed tenants.**
+- **Data Mask Managed Package end-of-service: November 2026**. Customers on the legacy package must migrate before then.
+- **Own Accelerate end-of-life: December 2027**. Existing Accelerate customers should renew onto Data Mask + $0 Seed SKU at renewal time, not extend Accelerate.
+- **GovCloud / FedRAMP**: Salesforce Data Seeding Gov is also $0 add-on to Data Mask (FedRAMP Moderate).
+- **Data Cloud / Data 360 seeding (DLO → DLO) is *Coming Soon*** on the FY27 roadmap, **not GA today**. For DC-heavy customers, the native answer isn't fully there yet — this is the strongest current deviation case for keeping a third-party tool.
+- **LLMs do not belong in this pipeline**. Data Mask & Seed is deterministic by design; auditors will not accept "the AI picked these records." If a customer or vendor pitches AI-driven seeding, push the LLM use back to *build time* (generating templates, drafting test cases) — the runtime data path stays deterministic.
+- **Bypassing automations is a sharp tool**. Seed bypasses managed-package triggers and flows during insert. This is what makes it fast — but if your business logic computes derived fields via Apex/Flow, you may need to run a one-time post-seed batch to rehydrate them.
+
+**ROI Anchor**
+
+10% Net AOV for Data Mask + $0 for Seed (when sold together) vs:
+- 1–4 weeks of dev/admin time per refresh (Data Loader + CSVs)
+- 30x cost-of-bugs multiplier for issues that escape to prod because the test data was unrepresentative (NIST)
+- Auditor friction in regulated industries when the masking control is "we trust the contractor not to look"
+
+**When to use**
+
+Any Salesforce shop running ≥1 sandbox refresh per quarter. Especially:
+- Regulated industries (HIPAA, SOX, FedRAMP, FINRA, GDPR/CCPA-bound)
+- Admin-heavy teams who need a native UI rather than custom scripts
+- Customers using third-party contractors or SI partners
+- Customers running CPQ, FSL, or nCino (bundled starter templates apply)
+- Customers planning Agentforce rollout (need realistic, compliant data to test agent behavior)
+
+**When This Pattern Is Not Enough** (defensible deviations):
+
+- **Heavy SBQQ CPQ + OmniStudio data movement** at scale where Prodly's pre-built Apps still beat Data Seed's templates and the customer has already invested in the Prodly data model
+- **Data Cloud / Data 360 seeding** until DLO → DLO seeding is GA
+- **Existing Flosum customers** whose bundled Data Migrator covers their CPQ flavor adequately on a current contract — use what's paid for, revisit at renewal
+- **Customers on Own Accelerate today** — migration to Data Mask + $0 Seed is the recommendation, **not** staying on Accelerate (EOL Dec 2027)
+
+For the broader tooling decision matrix (when GitHub Actions vs Flosum vs Prodly vs DevOps Center), see the appendix at the end of this skill on managed-package matrix validation, and the `salesforce-alm-github` skill's broader patterns.
+
 ## Additional Key Workflows
 
 ### Branch Strategy for Salesforce
@@ -1513,4 +1653,77 @@ When completing an implementation, provide:
 
 ## Summary
 
-This skill enables Salesforce architects to modernize their teams' ALM practices by leveraging GitHub Enterprise's advanced features. The five core patterns (Matrix Strategy, OIDC with Custom Properties, Quick Deploy, Repository Dispatch, and Custom Properties for Governance) provide capabilities that traditional declarative tools cannot match, especially for teams scaling toward Agentforce and multi-cloud architectures. Use this skill to both educate teams on modern practices and to implement production-ready CI/CD pipelines.
+This skill enables Salesforce architects to modernize their teams' ALM practices by leveraging GitHub Enterprise's advanced features. The eight core patterns provide capabilities that traditional declarative tools cannot match, especially for teams scaling toward Agentforce and multi-cloud architectures. Use this skill to both educate teams on modern practices and to implement production-ready CI/CD pipelines.
+
+The eight patterns:
+
+1. **Matrix Strategy** — cross-version, cross-org parallel testing
+2. **Secure JWT + Custom Properties** (with optional Identity Broker tier) — auth without leaking keys to disk
+3. **Artifact Job-ID Passing** — Quick Deploy with validation IDs
+4. **Repository Dispatch** — system handshake across pipelines
+5. **Custom Properties for Governance** — read at runtime via `gh api`
+6. **Delta Deployments with sfdx-git-delta** — minute-scale incremental deploys
+7. **Unlocked Package Development** — the 20+ developer pattern
+8. **Sandbox Lifecycle with Data Mask & Seed** — refresh → mask → seed using native Salesforce tooling (GA July 2026)
+
+## Appendix: Matrix Validation with Managed Packages
+
+This appendix captures the additional design constraints that apply when Pattern 1 (Matrix Strategy) is used in ISV-heavy customer orgs (Certinia, Conga, SBQQ CPQ, Vlocity/OmniStudio, FinancialForce-now-Certinia, etc.). The base Matrix pattern works as written, but managed-package customers run into contractual, performance, and test-coverage realities that shape the matrix differently.
+
+### The 3-Leg Matrix Shape
+
+For an org with one or more managed packages, the defensible matrix is three legs, not N:
+
+1. **Vanilla** — base Salesforce metadata only, no managed package installed in the test sandbox. Fast (5–10 min). Catches regressions in your custom code that don't depend on the package
+2. **Integration-with-Package** — package installed but tests target only your custom integration surface (your Apex that calls the package's APIs). Medium (15–25 min). Catches integration breakage when the package version changes
+3. **Full-with-Package** — package + your customizations, full test run. Slow (30–90 min depending on package size). Catches end-to-end behavior
+
+Run vanilla on every PR. Run integration on PRs that touch the integration surface. Run full only on merge to main, or nightly.
+
+### `RunLocalTests` and Namespaced Managed-Package Tests
+
+`--test-level RunLocalTests` excludes namespaced managed-package tests **by design**. This is correct behavior — you should not be running the ISV's tests in your pipeline; you didn't write them, you can't fix them, and they're already certified by the AppExchange security review. But:
+
+- Your code coverage % is calculated *only* against your unmanaged code, not the package's
+- If you have Apex that extends the package (custom triggers on `SBQQ__Quote__c`, etc.), those tests **are** local and **do** run
+- If a package upgrade breaks your integration, your local tests should catch it — that's the integration-leg purpose
+
+### Per-Sandbox Licensing Implications
+
+Several ISVs license per non-prod org, not per user:
+
+- **Certinia (formerly FinancialForce)**: per-org licensing on some SKUs; running 5 parallel matrix sandboxes can be a license event
+- **Conga**: similar; check the MSA before standing up a 5-leg matrix
+- **SBQQ (Salesforce CPQ)**: included with the base SKU but with sandbox-tier limits
+- **Vlocity / OmniStudio**: typically included with Industries SKUs, but heavy data movement in matrix legs can hit storage limits
+
+Read the MSA before committing to a matrix shape that requires N parallel sandboxes.
+
+### Validation Time Blooms with Managed Packages
+
+A vanilla `sf project deploy validate` runs in 3–8 minutes. The same validation against an org with a heavy managed package (Vlocity full, large SBQQ data model) can run 30–60 minutes because Salesforce must validate against all package metadata. This is why you put the heavy legs on **merge events** or **nightly schedules**, not on every PR.
+
+### Test Data Setup Factories for Managed-Package Tests
+
+Each major ISV has its own minimum data setup pattern:
+
+- **Certinia**: needs a `c2g__codaCompany__c` record before any GL test
+- **Conga**: needs a Conga Solution record + template metadata
+- **SBQQ CPQ**: needs a base Account, Opportunity, Quote header before line-item tests; product rules require Product2 + PriceBook2 + PricebookEntry
+- **OmniStudio / Vlocity**: needs `vlocity_cmt__DRBundle__c` configurations for Data Raptors
+
+Encode these as a `@TestSetup` factory class per package. Reuse across matrix legs.
+
+### Contractual Due-Diligence Checklist
+
+Before recommending a matrix-with-packages strategy at scale:
+
+- [ ] Read the ISV's MSA — confirm sandbox-tier licensing
+- [ ] Confirm per-org vs per-user pricing on the relevant SKU
+- [ ] Get vendor sign-off in writing if you're standing up >2 non-prod orgs with the package installed
+- [ ] Verify the customer's existing seat count covers the test environments (some MSAs auto-true-up at audit time)
+- [ ] Pair this with Pattern 8 (Data Mask & Seed) — the package starter templates (CPQ, FSL, nCino are bundled in Data Mask & Seed) accelerate the test-data-setup work above
+
+### When the Matrix Itself Is Wrong
+
+For 20+ developer codebases with ISV-heavy customizations, **Pattern 7 (Unlocked Packages) is a better answer than a wider matrix**. Decompose your customizations into unlocked packages, version-pin against the ISV's package, and run per-package tests. Matrix is a stopgap when packages aren't yet feasible.
